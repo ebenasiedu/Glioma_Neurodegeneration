@@ -1,5 +1,5 @@
 # Glioma_Neurodegeneration
-# The repo contains raw data, processed data and codes associated with the study
+# The repo contains raw data, processed data and codes to replicate the analyses and results associated with the study
 
 # Mutation Folder 
 - Contains raw data and R session file to generate all results related to mutation analyses in the manuscript 
