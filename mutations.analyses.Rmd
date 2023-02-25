@@ -1,0 +1,350 @@
+---
+output:
+  html_document: default
+  word_document: default
+  pdf_document: default
+---
+
+```{r setup, include=FALSE, message=FALSE}
+library(dplyr)
+library(ggplot2)
+library(reshape2)
+library(ggExtra)
+library(plyr)
+library(ggridges)
+library(viridis)
+library(ggpubr)
+library(tibble)
+library(janitor)
+library(AnnotationDbi)
+library(org.Hs.eg.db)
+library(ggsci)
+library(tidyverse)
+library(survival)
+library(survminer)
+library(readr)
+library(purrr)
+library(data.table)
+library(maftools)
+library(ggoncoplot)
+library(cBioPortalData)
+library(scales)
+library(patchwork)
+library(emmeans)
+library(car)
+library(clusterProfiler)
+library(gridExtra)
+
+knitr::opts_chunk$set(echo = TRUE)
+
+#set up palette
+mypal = (viridis_pal()(16))
+#show_col(mypal)
+
+```
+
+# Define path and session data
+
+```{r}
+# define working directory path
+workPath <- "C:/Users/ebenezer.asiedu/Desktop/Bioinfo/PROJECT/onconeuro/"
+
+# load R session
+load(paste0(workPath, "mutation/mutation.RData"))
+
+```
+
+# Define functions 
+
+```{r echo=FALSE,fig.width=16.89,fig.height=7.33}
+# Prep and plot lateration profiles of AD and PD risk/causative genes
+alteration.plot <- function(id){
+  if (id == "AD"){df <- read.delim(paste0(workPath,"mutation/AD_cancer_types_summary.txt"),header = T)}
+  if (id == "PD"){df <- read.delim(paste0(workPath,"mutation/PD_cancer_types_summary.txt"),header = T)}
+  # Alteration Frequency by Glioma study
+  df <- df %>% dplyr::select(-c(4))
+  colnames(df) <- c("cancer", "frq", "type")
+  #df[df == "Glioma"] <- "Lower-grade glioma"
+  df[df == "amp"] <- "Copy number gain"
+  df[df == "gain"] <- "Copy number gain"
+  df[df == "hetloss"] <- "Hemizygous deletion"
+  df[df == "homdel"] <- "Homozygous deletion"
+  df[df == "multiple"] <- "Multi_Hit"
+  df[df == "mutated"] <- "Missense_Mutation"
+  colnames(df) <- c("Cancer_Type", "Alteration_Frequency", "Alteration Type")
+  my_cols = c("#440154FF","#39568CFF","#FDE725FF", "#7AD151FF","#1F988BFF")
+  names(my_cols) = c('Hemizygous deletion','Copy number gain','Homozygous deletion', 'Missense_Mutation','Multi_Hit')
+  df$`Alteration Type` <- factor(df$`Alteration Type` , levels = c("Hemizygous deletion","Copy number gain","Multi_Hit",
+                                                                                 "Homozygous deletion", "Missense_Mutation"))
+  plt <- ggplot(df, aes(Cancer_Type, Alteration_Frequency, fill=`Alteration Type`)) + 
+      geom_bar(stat = "identity") + theme_classic(base_size = 15) + ylab("Alteration Frequency (%)") + 
+      xlab("") + theme(panel.border = element_rect(size = 1, fill = NA)) + 
+      scale_fill_manual(values = my_cols, aesthetics = "fill") + coord_flip()
+return(plt)}
+
+
+# Prep TCGA clinical and alteration profiles
+tcga.prep <- function(id,dis){
+  if (id == "lgg"){mut.data <- paste0("lgg_tcga_mutations",".txt",sep="")
+  cna.data <- paste0("lgg_tcga_cna",".txt",sep="")}
+  if (id == "gbm"){mut.data <- paste0("gbm_tcga_mutations",".txt",sep="")
+  cna.data <- paste0("gbm_tcga_cna",".txt",sep="")}
+  if (dis == "AD"){df <- ADrisk}
+  if (dis == "PD"){df <- PDrisk}
+  #mutations
+  mut <- read.delim(mut.data) %>% 
+    dplyr::select(c(Hugo_Symbol,Variant_Classification,Tumor_Sample_Barcode, Chromosome,
+                Start_Position,End_Position, Strand,Reference_Allele,Tumor_Seq_Allele2, Variant_Type))
+  mut <- merge(df,mut,by.y="Hugo_Symbol", all=F) 
+  mut$Tumor_Sample_Barcode <- sub("-", ".", mut$Tumor_Sample_Barcode)
+  mut$Tumor_Sample_Barcode <- sub("-", ".", mut$Tumor_Sample_Barcode)
+  mut$Tumor_Sample_Barcode <- sub("-", ".", mut$Tumor_Sample_Barcode)
+  #CNA
+  cna <- read.delim(cna.data)
+  cna <- merge(df,cna,by.y="Hugo_Symbol", all=F) %>% dplyr::select(-c(2)) 
+  rownames(cna) <- cna$Hugo_Symbol
+  cna <- dplyr::select(cna, -c(1))
+  cna[cna == 0] <- "NA"
+  cna[cna == -1] <- "Hemizygous deletion"
+  cna[cna == -2] <- "Homozygous deletion"
+  cna[cna == +1] <- "Copy number gain"
+  cna[cna == +2] <- "Copy number gain"
+  cna <- cna %>% rownames_to_column("Hugo_Symbol")
+  cna <- melt(cna, id="Hugo_Symbol") 
+  colnames(cna) <-  c("Hugo_Symbol", "Tumor_Sample_Barcode", "CN")
+  cna <- filter(cna, CN != "NA")
+return(list(mut,cna))}
+
+# Plotting survival plots
+mysurv <- function(class){
+  name = paste(gene, class, sep = "_")
+        OSdata.cna <- filter(cna, Hugo_Symbol == gene) %>% dplyr::select(-c(1)) %>% 
+          rename("Variant_Classification" = "CN")
+        OSdata.mut <- filter(mut, Hugo_Symbol == gene) %>% 
+          dplyr::select(c("Tumor_Sample_Barcode","Variant_Classification"))
+        OS.data1 <- rbind(OSdata.mut, OSdata.cna)
+        OS.data1$Tumor_Sample_Barcode <- gsub('[.]', '-', OS.data1$Tumor_Sample_Barcode)
+        OS.data1$Tumor_Sample_Barcode <- sub("-01", "", OS.data1$Tumor_Sample_Barcode)
+        OS.data <- merge(OS.data1, clin.data, by.y="Tumor_Sample_Barcode", all=T)
+        OS.data$OS_MONTHS <- as.numeric(as.character(OS.data$OS_MONTHS))
+        OS.data$OS_STATUS <- sub("\\:[^.]*$", "",OS.data$OS_STATUS)
+        OS.data[OS.data == "Homozygous deletion"] <-  "NO"
+        OS.data[OS.data==  "Amplification"] <- "Copy number gain"
+        OS.data[OS.data == "Missense_Mutation"] <- "NO"
+        OS.data[OS.data == "Multi_Hit"] <- "NO"
+        OS.data[OS.data == "Frame_Shift_Ins"] <- "NO"
+        OS.data[OS.data == "Frame_Shift_Del"] <- "NO"
+        OS.data[OS.data == "In_Frame_Ins"] <- "NO"
+        OS.data[OS.data== "Splice_Site"] <- "NO"
+        OS.data[OS.data == "Nonsense_Mutation"] <- "NO"
+        OS.data[OS.data == "Silent"] <- "NO"
+        OS.data[OS.data == "5'UTR"] <- "NO"
+        OS.data$Variant_Classification[is.na(OS.data$Variant_Classification)] <- "Unaltered"
+        OS.data <- rename(OS.data, Group = Variant_Classification) %>% filter(Group != "NO") 
+        OS.data[OS.data == "Astrocytoma"] <- "LGG-Astrocytoma"
+        OS.data[OS.data == "Oligodendroglioma"] <- "LGG-Oligodendroglioma"
+        OS.data[OS.data == "Oligoastrocytoma"] <- "LGG-Oligoastrocytoma"
+        OS.data[OS.data == "Untreated primary (de novo) GBM"] <- "Glioblastoma"
+        OS.data[OS.data == "Glioblastoma Multiforme (GBM)"] <- "Glioblastoma"
+        OS.data <- OS.data %>% filter(HISTOLOGICAL_DIAGNOSIS == class)
+        OS.data1 <- OS.data
+        OS.data$Group <- factor(OS.data$Group, levels = c("Unaltered", "Copy number gain", "Hemizygous deletion"))
+        surv = Surv(time = OS.data$OS_MONTHS, event = as.numeric(OS.data$OS_STATUS))
+        fit <- survival::survfit(formula = surv ~ Group, data=OS.data)
+        p <- ggsurvplot(fit = fit, pval = F, risk.table = T, fun = "pct", conf.int =F, xlim = c(0,200), break.x.by = 20,
+            xlab = "Overall survival time (Months)", ylab = "Overall survival probability (%)",
+            risk.table.title="", ggtheme =  theme_classic(base_size = 15), 
+            palette = c("#808080", "#39568CFF","#440154FF"),
+            legend.labs = c("Unaltered", "Copy number gain", "Hemizygous deletion"))
+        surv = Surv(time = OS.data1$OS_MONTHS, event = as.numeric(OS.data1$OS_STATUS))
+        fit <- survival::survfit(formula = surv ~ Group, data=OS.data1)
+        cox_reg_model <- coxph(formula = surv ~ Group + AGE, OS.data1)  
+        fit.p <- as.data.frame(summary(emmeans(cox_reg_model,pairwise~Group)$contrasts,type="response")) %>% 
+          dplyr::select(contrast,ratio,p.value) %>% rename("hazard ratio"="ratio")        
+        p$plot <- p$plot+ annotation_custom(tableGrob(fit.p, rows=NULL,theme = ttheme_minimal(base_size = 10)),
+                                            xmin=150, xmax=160, ymin=90, ymax=98)
+        p <- p + ggtitle(name)
+        return(p)}
+```
+
+
+# Analyzing gene alterations {.tabset}
+
+```{r echo=FALSE,fig.width=16.89,fig.height=7.33}
+## Prep AD risk and causative genes
+df <-  read.table(paste0(workPath,"mutation/ADgenes.txt"),header = T)
+df <- data.frame(Gene = c(df[!duplicated(df$Genes),]))
+ADrisk <- bitr(df$Gene, fromType = "SYMBOL",toType = c("ENTREZID"), OrgDb = org.Hs.eg.db) %>% drop_na() %>%
+  dplyr::select(-c(ENTREZID)) %>% rename(Hugo_Symbol=SYMBOL)
+## Prep PD risk and causative genes
+df <-  read.table(paste0(workPath,"mutation/PDgenes.txt"),header = T)
+df <- data.frame(Gene = c(df[!duplicated(df$Genes),]))
+PDrisk <- bitr(df$Gene, fromType = "SYMBOL",toType = c("ENTREZID"), OrgDb = org.Hs.eg.db) %>% drop_na() %>%
+   dplyr::select(-c(ENTREZID)) %>% rename(Hugo_Symbol=SYMBOL)
+
+## Alteration profile plot
+a <- alteration.plot("AD")
+b <- alteration.plot("PD")
+AD.PD.alt.plot <- ggarrange(a,b,common.legend = T, legend = "right")
+
+```
+
+
+# Oncoplot {.tabset}
+
+```{r echo=FALSE,fig.width=16.89,fig.height=7.33}
+########### Prep data ###################
+setwd(paste0(workPath,"mutation/"))
+#AD
+lgg.data <- tcga.prep("lgg","AD")
+gbm.data <- tcga.prep("gbm","AD")
+# combine lgg and gbm data
+ADrisk.mut <- rbind(gbm.data[[1]],lgg.data[[1]])
+AD.risk.cna <- rbind(gbm.data[[2]],lgg.data[[2]])
+#PD
+lgg.data <- tcga.prep("lgg","PD")
+gbm.data <- tcga.prep("gbm","PD")
+# combine lgg and gbm data
+PDrisk.mut <- rbind(gbm.data[[1]],lgg.data[[1]])
+PD.risk.cna <- rbind(gbm.data[[2]],lgg.data[[2]])
+
+
+############ plot oncoplot ###################
+# AD
+tcga.onco <- read.maf(maf = ADrisk.mut, cnTable = AD.risk.cna, isTCGA = T)
+my_cols = c("#440154FF","#39568CFF","#1F988BFF", "#7AD151FF", "#FDE725FF","#35B779FF", "#8b0000", "#54C568FF", "#23888EFF", "#000000","#54C568FF", "#31688EFF")
+names(my_cols) = c('Hemizygous deletion','Copy number gain','Homozygous deletion', 'Missense_Mutation','Multi_Hit',
+                   'Frame_Shift_Ins','Frame_Shift_Del','In_Frame_Ins','Splice_Site','In_Frame_Del', 'Nonsense_Mutation')
+oncoplot(maf = tcga.onco, top = 25, colors = my_cols, fontSize = 1, altered = T,
+         legendFontSize = 1.5, legend_height = 4, showTitle = F, borderCol = NULL,
+         includeColBarCN = F, drawRowBar = F, drawColBar = F)
+# PD
+tcga.onco <- read.maf(maf = PDrisk.mut, cnTable = PD.risk.cna, isTCGA = T)
+my_cols = c("#440154FF","#39568CFF","#1F988BFF", "#7AD151FF", "#FDE725FF","#35B779FF", "#8b0000", "#54C568FF", "#23888EFF", "#000000","#54C568FF", "#31688EFF")
+names(my_cols) = c('Hemizygous deletion','Copy number gain','Homozygous deletion', 'Missense_Mutation','Multi_Hit',
+                   'Frame_Shift_Ins','Frame_Shift_Del','In_Frame_Ins','Splice_Site','In_Frame_Del', 'Nonsense_Mutation')
+oncoplot(maf = tcga.onco, top = 25, colors = my_cols, fontSize = 1, altered = T,
+         legendFontSize = 1.5, legend_height = 4, showTitle = F, borderCol = NULL,
+         includeColBarCN = F, drawRowBar = F, drawColBar = F)
+
+```
+
+
+# Survival Analysis {.tabset}
+
+```{r echo=FALSE,fig.width=16.89,fig.height=7.33}
+# Prep TCGA data
+lgg.tcga.clin <- read.delim(paste0(workPath,"mutation/lgg_tcga_clinical_patient.txt"), header = T, skip = 4) %>%
+  dplyr::select("PATIENT_ID","AGE", "OS_MONTHS", "OS_STATUS", "HISTOLOGICAL_DIAGNOSIS") %>%
+  dplyr::rename(Tumor_Sample_Barcode = PATIENT_ID)
+#lgg.tcga.clin$Class = "Glioma"
+lgg.tcga.clin$OS_MONTHS <- as.numeric(as.character(lgg.tcga.clin$OS_MONTHS))
+lgg.tcga.clin$OS_STATUS <- sub("\\:[^.]*$", "",lgg.tcga.clin$OS_STATUS)
+lgg.tcga.clin <- drop_na(lgg.tcga.clin)
+gbm.tcga.clin <- read.delim(paste0(workPath,"mutation/gbm_tcga_clinical_patient.txt"), header = T, skip = 4) %>%
+  dplyr::select("PATIENT_ID","AGE", "OS_MONTHS", "OS_STATUS", "HISTOLOGICAL_DIAGNOSIS") %>%
+  dplyr::rename(Tumor_Sample_Barcode = PATIENT_ID)
+#gbm.tcga.clin$Class = "Glioblastoma"
+gbm.tcga.clin$OS_MONTHS <- as.numeric(as.character(gbm.tcga.clin$OS_MONTHS))
+gbm.tcga.clin$OS_STATUS <- sub("\\:[^.]*$", "",gbm.tcga.clin$OS_STATUS)
+gbm.tcga.clin <- drop_na(gbm.tcga.clin)
+clin.data <- rbind(lgg.tcga.clin,gbm.tcga.clin)
+mut <- rbind(ADrisk.mut,PDrisk.mut)
+cna <- rbind(AD.risk.cna,PD.risk.cna)
+
+```
+
+```{r echo=FALSE,fig.width=16.89,fig.height=7.33}
+## Combine AD and PDrisk genes
+AD.PD.risk.gene <- rbind(ADrisk,PDrisk)
+cc <- merge(AD.PD.risk.gene,cna,by.y="Hugo_Symbol") %>% dplyr::select(c(Hugo_Symbol))
+cc <- cc[!duplicated(cc$Hugo_Symbol),]
+
+## Get cox p-values for each risk gene
+# define function to calc cox-pvalues for each gene, adjusted for by age and glioma class
+Gene <- vector(mode = 'character', length = length(cc))
+p1 <- vector(mode = 'numeric', length = length(cc))
+p2 <- vector(mode = 'numeric', length = length(cc))
+p3 <- vector(mode = 'numeric', length = length(cc))
+p4 <- vector(mode = 'numeric', length = length(cc))
+for (gene in cc){
+    OSdata.cna <- filter(cna, Hugo_Symbol == gene) %>% dplyr::select(-c(1)) %>%
+         rename(Variant_Classification = CN)
+    OSdata.mut <- filter(mut, Hugo_Symbol == gene) %>%
+          dplyr::select(c("Tumor_Sample_Barcode","Variant_Classification"))
+    OS.data1 <- rbind(OSdata.mut, OSdata.cna)
+    OS.data1$Tumor_Sample_Barcode <- gsub('[.]', '-', OS.data1$Tumor_Sample_Barcode)
+    OS.data1$Tumor_Sample_Barcode <- sub("-01", "", OS.data1$Tumor_Sample_Barcode)
+    OS.data <- merge(OS.data1, clin.data, by.y="Tumor_Sample_Barcode", all=T)
+    OS.data$OS_MONTHS <- as.numeric(as.character(OS.data$OS_MONTHS))
+    OS.data$OS_STATUS <- sub("\\:[^.]*$", "",OS.data$OS_STATUS)
+    OS.data[OS.data==  "Amplification"] <- "Copy number gain"
+    OS.data[OS.data == "Missense_Mutation"] <- "NO"
+    OS.data[OS.data == "Multi_Hit"] <- "NO"
+    OS.data[OS.data == "Frame_Shift_Ins"] <- "NO"
+    OS.data[OS.data == "Frame_Shift_Del"] <- "NO"
+    OS.data[OS.data == "In_Frame_Ins"] <- "NO"
+    OS.data[OS.data== "Splice_Site"] <- "NO"
+    OS.data[OS.data == "Nonsense_Mutation"] <- "NO"
+    OS.data[OS.data == "Silent"] <- "NO"
+    OS.data$Variant_Classification[is.na(OS.data$Variant_Classification)] <- "Unaltered"
+    OS.data <- rename(OS.data, Group = Variant_Classification) %>% filter(Group != "NO")
+    OS.data[OS.data == "Astrocytoma"] <- "LGG-Astrocytoma"
+    OS.data[OS.data == "Oligodendroglioma"] <- "LGG-Oligodendroglioma"
+    OS.data[OS.data == "Oligoastrocytoma"] <- "LGG-Oligoastrocytoma"
+    OS.data[OS.data == "Untreated primary (de novo) GBM"] <- "Glioblastoma"
+    OS.data[OS.data == "Glioblastoma Multiforme (GBM)"] <- "Glioblastoma"
+    OS.data <- OS.data %>% rename(Type = HISTOLOGICAL_DIAGNOSIS) %>% filter(Type != "Treated primary GBM")
+    surv = Surv(time = OS.data$OS_MONTHS, event = as.numeric(OS.data$OS_STATUS))
+    fit <- survival::survfit(formula = surv ~ Group, data=OS.data)
+    cox_reg_model <- coxph(formula = surv ~ Group + AGE + Type, OS.data)
+    fit.p <- as.data.frame(summary(emmeans(cox_reg_model,pairwise~Group)$contrasts,type="response")) %>%
+              dplyr::select(contrast,ratio,p.value) %>% rename("hazard ratio"="ratio")
+    a <- fit.p %>% filter(contrast == "Copy number gain / Hemizygous deletion")
+    b <- fit.p %>% filter(contrast == "Copy number gain / Unaltered")
+    c <- fit.p %>% filter(contrast == "Hemizygous deletion / Unaltered")
+    Gene[gene] <- gene
+    p1[gene] <- a$p.value
+    p2[gene] <- a$`hazard ratio`
+    p3[gene] <- b$`hazard ratio`
+    p4[gene] <- c$`hazard ratio`}
+# get cox p-values
+cox.pval.risk.genes <- data.frame(Gene,p1,p2,p3,p4) %>% tail(n=156L) %>%
+  filter(p2 > 1) %>% filter(p4 < 0.8)
+
+# Plot survplots for GOIs
+# cc <- cox.pval.risk.genes$Gene
+# for (gene in cc){
+#     ast <- mysurv("LGG-Astrocytoma")
+#     olias<- mysurv("LGG-Oligoastrocytoma")
+#     oliden<- mysurv("LGG-Oligodendroglioma")
+#     gbm<- mysurv("Glioblastoma")
+#     x.plot <- ggarrange(ast$plot,olias$plot,oliden$plot,gbm$plot, ncol = 4, common.legend = T, legend = "right")
+#     print(x.plot)}
+
+
+#Plot for interesting GOIs
+goi <- data.frame(Gene = c("NTN5","LILRB2","CD33","APOE"))
+cc <- goi$Gene
+for (gene in cc){
+    ast <- mysurv("LGG-Astrocytoma")
+    olias<- mysurv("LGG-Oligoastrocytoma")
+    oliden<- mysurv("LGG-Oligodendroglioma")
+    gbm<- mysurv("Glioblastoma")
+    x.plot <- ggarrange(ast$plot,olias$plot,oliden$plot,gbm$plot, ncol = 2, common.legend = T, legend = "right")
+    print(x.plot)}
+            
+```
+
+```{r echo=FALSE,fig.width=24,fig.height=7.17,message=FALSE,warning=FALSE}
+#Plot for interesting GOIs
+# goi <- data.frame(Gene = c("NTN5","LILRB2","CD33","APOE"))
+# cc <- goi$Gene
+# for (gene in cc){
+#     ast <- mysurv("LGG-Astrocytoma")
+#     gbm<- mysurv("Glioblastoma")
+#     x.plot <- ggarrange(ast$plot,gbm$plot, ncol = 2, common.legend = T, legend = "top")
+#     print(x.plot)}
+
+```
+

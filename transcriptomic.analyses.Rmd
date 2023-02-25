@@ -1,0 +1,1077 @@
+---
+title: "Transcriptomic Profiling"
+output:
+  word_document: default
+  html_document: default
+pdf_document: default
+---
+
+```{r setup, include=FALSE, message=FALSE}
+library(data.table)
+library(dplyr)
+library(purrr)
+library(tidyverse)
+library(reshape2)
+library(ggplot2)
+library(pheatmap)
+library(plyr)
+library(vsn)
+library(tidyr)
+library(DESeq2)
+library(RUVSeq)
+library(glmGamPoi)
+library(clusterProfiler)
+library(org.Hs.eg.db)
+library(ggrepel)
+library(ggvenn)
+library(ggsci)
+library(Biobase)
+library(AnnotationDbi)
+library(GEOquery)
+library(limma)
+library(viridis)
+library(ggpubr)
+library(survival)
+library(survminer)
+library(emmeans)
+library(car)
+library(corrplot)
+library(correlation)
+library(splitstackshape)
+library(STRINGdb)
+library(glue)
+library(tibble)
+library(gridExtra)
+library(patchwork)
+
+
+knitr::opts_chunk$set(echo = TRUE)
+
+```
+
+# Define path and session data
+
+```{r}
+# define working directory path
+workPath <- "C:/Users/ebenezer.asiedu/Desktop/Bioinfo/PROJECT/onconeuro/"
+
+# load transcriptomic data R session
+load(paste0(workPath, "transcriptomics/AD.data.RData"))  # AD data
+load(paste0(workPath, "transcriptomics/PD.data.RData"))  # PD data
+load(paste0(workPath, "transcriptomics/Glioma.data.RData")) # Glioma data
+```
+
+
+# Define Functions
+
+```{r, echo=FALSE,message=FALSE, warning=FALSE}
+
+# Z-score function
+Zscore <- function(x){
+  x1 <- x + 10 # add pseudo-count to each data b4 log-transform
+  x2 <- log2(x1) # log-trasnform
+  x3 <- sapply(x2, function(x2) (x2-mean(x2))/sd(x2))
+  rownames(x3) = rownames(x1)
+  x3 <- as.data.frame(x3)}
+
+# Funciton to pred z-scores for genes in disesae groups
+data.prep <- function(id,is.arrays = TRUE, anno_col = "Gene Symbol",disease,category){
+  #id = GEO ID,
+  # is.array = is it an array or RNA-seq
+  # anno_col = annotation column
+  # disease = disease state
+  # category = disease or CTRL
+      k <- get(paste0(id,'.seq.data'))
+      kk <- k[["counts"]]
+      kkk <- k[["meta"]] 
+      if (ncol(kkk) < 2) {kkk <- kkk %>% rownames_to_column(var = "ID")}
+      colnames(kkk) <- c("ID","Condition")
+      if (category == "DIS"){
+        kkk <- kkk %>% dplyr::filter(Condition == "DIS")
+        kkk$Condition <- gsub("DIS", disease, kkk$Condition)}
+      if (category == "CTRL"){
+      kkk <- kkk %>% dplyr::filter(Condition == "CTRL")
+      kkk$Condition <- gsub("CTRL", disease, kkk$Condition)}
+      idx <- kkk[[1]]
+      cts  <- kk[, idx] 
+      cts <- Zscore(cts) %>% rownames_to_column("ID")
+
+      if (is.arrays ==TRUE){
+        gg <- k[["geneInfo"]] %>% dplyr::select("ID", anno_col) %>% 
+        remove_rownames() %>% rename("Gene" = anno_col)
+        cts <- merge(gg, cts, by.y="ID",all=F) %>% dplyr::select(-c(ID)) 
+        cts <- cts[!duplicated(cts$Gene),]
+        cts <- merge(AD.degs,cts, by.y="Gene",all=F) 
+        cts <- cts[!duplicated(cts$Gene),] %>% remove_rownames()}
+      if(is.arrays == FALSE){
+          if ("2597" %in% cts$ID){anno <- "ENTREZID"}
+          if ("ENSG00000111640" %in% cts$ID){anno <- "ENSEMBL"}
+          if ("GAPDH" %in% cts$ID){anno <- "SYMBOL"}
+            if (anno != "SYMBOL"){
+              c <- bitr(cts$ID, fromType = c(anno),toType = c("SYMBOL"), OrgDb = org.Hs.eg.db) %>%
+                rename("ID" = anno) %>% rename("Gene" = "SYMBOL")
+              cts <- merge(c, cts, by.y="ID",all=F) %>% dplyr::select(-c(ID))}
+            if (anno == "SYMBOL"){cts <- cts %>% rename(Gene = ID)}
+        cts <- merge(AD.degs,cts, by.y="Gene",all=F) 
+        cts <- cts[!duplicated(cts$Gene),] %>% remove_rownames()}
+      return(list(counts = cts, meta = kkk))}
+
+# Prepare data to have ENSEMBLE annotation
+deg.prep <- function(id){
+  k <- get(paste0(id,'.seq.data'))
+  k <- k[["degs"]]
+  if ("2597" %in% k$Gene){anno <- "ENTREZID"}
+  if ("ENSG00000111640" %in% k$Gene){anno <- "ENSEMBL"}
+  if ("GAPDH" %in% k$Gene){anno <- "SYMBOL"}
+  k <- k %>% dplyr::filter(padj < 0.05) %>% dplyr::filter(logFC < -0.5 | logFC > 0.5) %>% dplyr::select(-c(padj))
+  colnames(k) <- c(anno, id)
+  if (anno == "ENTREZID"){c <- bitr(k[[anno]], fromType = c(anno),toType = c("ENSEMBL"), OrgDb = org.Hs.eg.db)
+        kk <- merge(k,c,by.y=anno) %>% dplyr::select(-c(anno)) %>% rename("Gene" = "ENSEMBL")
+          return(kk)}
+    if (anno == "SYMBOL"){c <- bitr(k[[anno]], fromType = c(anno),toType = c("ENSEMBL"), OrgDb = org.Hs.eg.db)
+        kk <- merge(k,c,by.y=anno) %>% dplyr::select(-c(anno)) %>% rename("Gene" = "ENSEMBL")
+          return(kk)} 
+  else{colnames(k) <- c("Gene", id)
+    return(k$Gene)}}
+
+#write function for GSEA analysis
+go.prep <- function(id){
+  k <- get(paste0(id,'.seq.data'))
+  golist <- k[["GSEA"]] %>% dplyr::select("Description", "NES", "p.adjust") %>%
+    filter(p.adjust < 0.05 & (NES > 2 | NES < -2)) %>% remove_rownames() %>% 
+    dplyr::select("Description", "NES")
+  return(golist)}
+
+
+# Function for survival analysis plot
+mysurv <- function(class){
+        id = gene
+        name = paste(id, class, sep = "_")
+        OSdata <- filter(expr.data, Gene == gene ) %>% dplyr::select(-c(1))
+        OSdata$PATIENT_ID <- gsub('[.]', '-', OSdata$PATIENT_ID)
+        OS.data <- merge(OSdata, clin.data, by.y="PATIENT_ID", all=F) %>% filter(Class == class)
+        OS.data$Expression <- factor(OS.data$Expression, levels = c("Increased", "Decreased", "Normal"))
+        surv = Surv(time = OS.data$OS_MONTHS, event = as.numeric(OS.data$OS_STATUS))
+        fit <- survfit(formula = surv ~ Expression, data = OS.data)
+        cox_reg_model <- coxph(formula = surv ~ Expression + AGE, data = OS.data)  
+        #cox_reg_model.summ <- summary(cox_reg_model)
+        fit.p <- as.data.frame(summary(emmeans(cox_reg_model,pairwise~Expression)$contrasts,type="response")) %>% 
+          dplyr::select(contrast,ratio,p.value) %>% rename("hazard ratio"="ratio")   
+        p <- ggsurvplot(fit = fit, pval = F, risk.table = F, fun = "pct", conf.int =F, xlim = c(0,200), break.x.by = 20,
+                  xlab = "Overall survival time (Months)", ylab = "Overall survival probability (%)", 
+                  risk.table.title="", ggtheme =  theme_classic(base_size = 15), 
+                  palette = c("#440154FF","#39568CFF","#808080"), legend="top", 
+                  legend.labs= c("Increased", "Decreased", "Normal"))
+       p$plot <- p$plot+ annotation_custom(tableGrob(fit.p, rows=NULL,theme = ttheme_minimal(base_size = 10)),
+                                            xmin=150, xmax=160, ymin=90, ymax=98)
+        p <- p + ggtitle(name)}
+
+# Ploting expression Zscores
+expr.plot <- function(gene.id){
+  df <- zscore.boxplot.df %>% filter(Gene == gene.id) 
+  fit <- lm(value~variable, df)
+  fit.p <- as.data.frame(summary(emmeans(fit,pairwise~variable)$contrasts,type="response")) %>% dplyr::select(1,2,6) %>% 
+    rename("effect size" = "estimate")
+  # Plot
+  df1 <- df %>% filter(variable == "PD")
+  df$variable <- factor(df$variable, levels = c("Glioma", "CTRL", "AD", "PD"))
+  my_cols <- c("#440154FF", "#39568CFF","#35B779FF", "gray")
+  names(my_cols) <- c("Glioma", "CTRL", "AD", "PD")
+  p <- ggplot(df, aes(x=variable, y=value, fill=variable)) + geom_boxplot(alpha=0.5) + theme_classic(base_size = 20) +
+    geom_jitter(aes(color=variable), size=1.5) + scale_color_manual(values = my_cols)+ scale_fill_manual(values = my_cols)+
+    annotation_custom(tableGrob(fit.p, rows=NULL,theme = ttheme_minimal(base_size = 12)), xmin=4, xmax=4, ymin=(max(df1$value)+1.2), ymax=(max(df1$value)+1.2)) +
+    theme(legend.position = "none") + xlab("") + ylab(paste0(gene.id," mRNA expression Z-score")) 
+  print(p)}
+
+```
+
+
+## AD data analysis
+
+```{r}
+#########  DEGS  ##########
+# Get list of all degs for AD
+df <- list() # create an empty list
+# extract DEGs 
+zz <- c('GSE5281','GSE125583','GSE193438','GSE153873','GSE104704',
+        'GSE15222','GSE122063','GSE132903','GSE48350','GSE110226',
+       'GSE39420','GSE29378','GSE109887','GSE138260')
+for (i in zz){
+  k <- get(paste0(i,'.seq.data'))
+  k <- data.frame(Gene = k[["sig.degs"]][["Gene"]])
+  df[[i]] <- k}
+df <- do.call("rbind", df) # rbind list
+df <- data.frame(Gene = df[!duplicated(df$Gene),]) %>% remove_rownames()
+AD.degs <- data.frame(Gene = df[!duplicated(df$Gene),])
+
+# Prep z-scores for disease datasets
+GSE125583.seq.data[["dis.data"]] = data.prep("GSE125583", is.arrays = FALSE,disease = "AD1",category = "DIS")
+GSE125583.seq.data[["ctrl.data"]] = data.prep("GSE125583", is.arrays = FALSE,disease = "AD1",category = "CTRL")
+
+GSE193438.seq.data[["dis.data"]] = data.prep("GSE193438", is.arrays = FALSE,disease = "AD2",category = "DIS")
+GSE193438.seq.data[["ctrl.data"]] = data.prep("GSE193438", is.arrays = FALSE,disease = "AD2",category = "CTRL")
+
+GSE104704.seq.data [["dis.data"]] = data.prep("GSE104704", is.arrays = FALSE,disease = "AD3",category = "DIS")
+GSE104704.seq.data [["ctrl.data"]] = data.prep("GSE104704", is.arrays = FALSE,disease = "AD3",category = "CTRL")
+
+GSE153873.seq.data[["dis.data"]] = data.prep("GSE153873", is.arrays = FALSE,disease = "AD4",category = "DIS")
+GSE153873.seq.data[["ctrl.data"]] = data.prep("GSE153873", is.arrays = FALSE,disease = "AD4",category = "CTRL")
+
+#GSE15222.seq.data[["dis.data"]] = data.prep("GSE15222", is.arrays = TRUE,disease = "AD5")
+GSE122063.seq.data[["dis.data"]] = data.prep("GSE122063", is.arrays = TRUE,disease = "AD5", anno_col = "GENE_SYMBOL",category = "DIS")
+GSE122063.seq.data[["ctrl.data"]] = data.prep("GSE122063", is.arrays = TRUE,disease = "AD5", anno_col = "GENE_SYMBOL",category = "CTRL")
+
+GSE5281.seq.data[["dis.data"]] = data.prep("GSE5281", is.arrays = TRUE,disease = "AD6", anno_col = "Gene Symbol",category = "DIS")
+GSE5281.seq.data[["ctrl.data"]] = data.prep("GSE5281", is.arrays = TRUE,disease = "AD6", anno_col = "Gene Symbol",category = "CTRL")
+
+GSE132903.seq.data[["dis.data"]] = data.prep("GSE132903", is.arrays = TRUE,disease = "AD7", anno_col = "ILMN_Gene",category = "DIS")
+GSE132903.seq.data[["ctrl.data"]] = data.prep("GSE132903", is.arrays = TRUE,disease = "AD7", anno_col = "ILMN_Gene",category = "CTRL")
+
+GSE48350.seq.data[["dis.data"]] = data.prep("GSE48350", is.arrays = TRUE,disease = "AD8", anno_col = "Gene Symbol",category = "DIS")
+GSE48350.seq.data[["ctrl.data"]] = data.prep("GSE48350", is.arrays = TRUE,disease = "AD8", anno_col = "Gene Symbol",category = "CTRL")
+
+GSE110226.seq.data[["dis.data"]] = data.prep("GSE110226", is.arrays = TRUE,disease = "AD9", anno_col = "GeneSymbol",category = "DIS")
+GSE110226.seq.data[["ctrl.data"]] = data.prep("GSE110226", is.arrays = TRUE,disease = "AD9", anno_col = "GeneSymbol",category = "CTRL")
+
+GSE29378.seq.data[["dis.data"]] = data.prep("GSE29378", is.arrays = TRUE,disease = "AD10", anno_col = "ILMN_Gene",category = "DIS")
+GSE29378.seq.data[["ctrl.data"]] = data.prep("GSE29378", is.arrays = TRUE,disease = "AD10", anno_col = "ILMN_Gene",category = "CTRL")
+
+GSE138260.seq.data[["dis.data"]] = data.prep("GSE138260", is.arrays = TRUE,disease = "AD11", anno_col = "GENE_SYMBOL",category = "DIS")
+GSE138260.seq.data[["ctrl.data"]] = data.prep("GSE138260", is.arrays = TRUE,disease = "AD11", anno_col = "GENE_SYMBOL",category = "CTRL")
+
+GSE109887.seq.data[["dis.data"]] = data.prep("GSE109887", is.arrays = TRUE,disease = "AD12", anno_col = "ORF",category = "DIS")
+GSE109887.seq.data[["ctrl.data"]] = data.prep("GSE109887", is.arrays = TRUE,disease = "AD12", anno_col = "ORF",category = "CTRL")
+
+#GSE39420.seq.data[["dis.data"]] = dis.data.prep("GSE39420", is.arrays = TRUE,disease = "AD9", anno_col = "GeneSymbol")
+
+# Compile disease zscore matrix
+df <- list(GSE125583.seq.data[["dis.data"]][["counts"]],GSE193438.seq.data[["dis.data"]][["counts"]],
+                           GSE104704.seq.data [["dis.data"]][["counts"]],GSE153873.seq.data[["dis.data"]][["counts"]],
+                           GSE122063.seq.data[["dis.data"]][["counts"]],GSE5281.seq.data[["dis.data"]][["counts"]],
+                           GSE132903.seq.data[["dis.data"]][["counts"]], #GSE48350.seq.data[["dis.data"]][["counts"]],
+                           GSE110226.seq.data[["dis.data"]][["counts"]],GSE29378.seq.data[["dis.data"]][["counts"]],
+                           GSE138260.seq.data[["dis.data"]][["counts"]],GSE109887.seq.data[["dis.data"]][["counts"]])
+AD.dis.zscore.data <- join_all(df,by="Gene",match = "all") %>% column_to_rownames("Gene")
+AD.dis.zscore.data[is.na(AD.dis.zscore.data)] <- 0
+# Compile ctrl zscore matrix
+df <- list(GSE125583.seq.data[["ctrl.data"]][["counts"]],GSE193438.seq.data[["ctrl.data"]][["counts"]],
+                           GSE104704.seq.data [["ctrl.data"]][["counts"]],GSE153873.seq.data[["ctrl.data"]][["counts"]],
+                           GSE122063.seq.data[["ctrl.data"]][["counts"]],GSE5281.seq.data[["ctrl.data"]][["counts"]],
+                           GSE132903.seq.data[["ctrl.data"]][["counts"]], #GSE48350.seq.data[["ctrl.data"]][["counts"]],
+                           GSE110226.seq.data[["ctrl.data"]][["counts"]],GSE29378.seq.data[["ctrl.data"]][["counts"]],
+                           GSE138260.seq.data[["ctrl.data"]][["counts"]],GSE109887.seq.data[["ctrl.data"]][["counts"]])
+AD.ctrl.zscore.data <- join_all(df,by="Gene",match = "all") %>% column_to_rownames("Gene")
+AD.ctrl.zscore.data[is.na(AD.ctrl.zscore.data)] <- 0
+# Compile pheno
+df <- list(GSE125583.seq.data[["dis.data"]][["meta"]],GSE193438.seq.data[["dis.data"]][["meta"]],
+                           GSE104704.seq.data [["dis.data"]][["meta"]],GSE153873.seq.data[["dis.data"]][["meta"]],
+                           GSE122063.seq.data[["dis.data"]][["meta"]],GSE5281.seq.data[["dis.data"]][["meta"]],
+                           GSE132903.seq.data[["dis.data"]][["meta"]],#GSE48350.seq.data[["dis.data"]][["meta"]],
+                           GSE110226.seq.data[["dis.data"]][["meta"]],GSE29378.seq.data[["dis.data"]][["meta"]],
+                           GSE138260.seq.data[["dis.data"]][["meta"]],GSE109887.seq.data[["dis.data"]][["meta"]])
+AD.dis.pheno <- do.call("rbind", df) %>% column_to_rownames("ID") # rbind list
+AD.dis.pheno$Disease <- "Alzheimer's Disease" 
+
+# Plot heatmap to evaluate outlier dataset
+set.seed(120)
+AD.hm <- pheatmap(AD.dis.zscore.data, show_rownames = T, show_colnames = F, kmeans_k = 5,
+               annotation_col = AD.dis.pheno)
+# From the heatmap, AD8 is outlier, was excluded from downstream analysis
+
+###############################
+
+
+######### GSEA ###################
+# Compile GSEA info for all AD data
+AD.gsea <- list() # create an empty list
+zz <- c('GSE5281','GSE125583','GSE193438','GSE153873','GSE104704',
+        'GSE15222','GSE122063','GSE132903','GSE48350','GSE110226',
+       'GSE39420','GSE109887','GSE138260')
+for (i in zz){
+  k <- go.prep(i)
+  AD.gsea[[id = i]] <- k}
+
+# Get list of all GSEA terms for AD
+df <- list(AD.gsea[["GSE5281"]],AD.gsea[["GSE125583"]],AD.gsea[["GSE193438"]], AD.gsea[["GSE153873"]],
+           AD.gsea[["GSE104704"]],AD.gsea[["GSE15222"]],AD.gsea[["GSE122063"]],AD.gsea[["GSE132903"]],
+           AD.gsea[["GSE48350"]],AD.gsea[["GSE110226"]],AD.gsea[["GSE39420"]],
+           AD.gsea[["GSE109887"]],AD.gsea[["GSE138260"]])
+AD.gsea.terms <- do.call("rbind", df) 
+AD.gsea.terms <- AD.gsea.terms[!duplicated(AD.gsea.terms$Description),] %>% dplyr::select(c(1))
+
+#################################
+
+```
+
+
+
+## PD data analysis
+
+```{r}
+# create an empty list
+df <- list()
+# make sure data with the most genes is first
+zz <- c("GSE68719","GSE172409","GSE135743","GSE120746","GSE28894","GSE43490","GSE49036")
+for (i in zz){
+  k <- get(paste0(i,'.seq.data'))
+  k <- data.frame(Gene = k[["sig.degs"]][["Gene"]])
+  df[[i]] <- k}
+df <- do.call("rbind", df) # rbind list
+df <- data.frame(Gene = df[!duplicated(df$Gene),]) %>% remove_rownames()
+PD.degs <- data.frame(Gene = df[!duplicated(df$Gene),])
+
+# Prep z-scores for disease datasets
+GSE172409.seq.data[["dis.data"]] = data.prep("GSE172409", is.arrays = FALSE,disease = "PD1",category = "DIS")
+GSE172409.seq.data[["ctrl.data"]] = data.prep("GSE172409", is.arrays = FALSE,disease = "PD1",category = "CTRL")
+
+GSE135743.seq.data[["dis.data"]] = data.prep("GSE135743", is.arrays = FALSE,disease = "PD2",category = "DIS")
+GSE135743.seq.data[["ctrl.data"]] = data.prep("GSE135743", is.arrays = FALSE,disease = "PD2",category = "CTRL")
+
+GSE120746.seq.data[["dis.data"]] = data.prep("GSE120746", is.arrays = FALSE,disease = "PD3",category = "DIS")
+GSE120746.seq.data[["ctrl.data"]] = data.prep("GSE120746", is.arrays = FALSE,disease = "PD3",category = "CTRL")
+
+GSE68719.seq.data[["dis.data"]] = data.prep("GSE68719", is.arrays = FALSE,disease = "PD4",category = "DIS")
+GSE68719.seq.data[["ctrl.data"]] = data.prep("GSE68719", is.arrays = FALSE,disease = "PD4",category = "CTRL")
+
+GSE49036.seq.data[["dis.data"]] = data.prep("GSE49036", is.arrays = TRUE,disease = "PD5", anno_col = "Gene Symbol",category = "DIS")
+GSE49036.seq.data[["ctrl.data"]] = data.prep("GSE49036", is.arrays = TRUE,disease = "PD5", anno_col = "Gene Symbol",category = "CTRL")
+
+GSE43490.seq.data[["dis.data"]] = data.prep("GSE43490", is.arrays = TRUE,disease = "PD6", anno_col = "GENE_SYMBOL",category = "DIS")
+GSE43490.seq.data[["ctrl.data"]] = data.prep("GSE43490", is.arrays = TRUE,disease = "PD6", anno_col = "GENE_SYMBOL",category = "CTRL")
+
+GSE28894.seq.data[["dis.data"]] = data.prep("GSE28894", is.arrays = TRUE,disease = "PD7", anno_col = "ILMN_Gene",category = "DIS")
+GSE28894.seq.data[["ctrl.data"]] = data.prep("GSE28894", is.arrays = TRUE,disease = "PD7", anno_col = "ILMN_Gene",category = "CTRL")
+
+# Compile disease zscore matrix
+df <- list(GSE172409.seq.data[["dis.data"]][["counts"]], GSE135743.seq.data[["dis.data"]][["counts"]],
+           GSE120746.seq.data[["dis.data"]][["counts"]], GSE68719.seq.data[["dis.data"]][["counts"]],
+           GSE49036.seq.data[["dis.data"]][["counts"]]) #GSE43490.seq.data[["dis.data"]][["counts"]],
+           #GSE28894.seq.data[["dis.data"]][["counts"]])
+PD.dis.zscore.data <- join_all(df,by="Gene",match = "all") %>% column_to_rownames("Gene")
+PD.dis.zscore.data[is.na(PD.dis.zscore.data)] <- 0
+# Compile ctr zscore matrix
+df <- list(GSE172409.seq.data[["ctrl.data"]][["counts"]], GSE135743.seq.data[["ctrl.data"]][["counts"]],
+           GSE120746.seq.data[["ctrl.data"]][["counts"]], GSE68719.seq.data[["ctrl.data"]][["counts"]],
+           GSE49036.seq.data[["ctrl.data"]][["counts"]]) #GSE43490.seq.data[["ctrl.data"]][["counts"]],
+           #GSE28894.seq.data[["ctrl.data"]][["counts"]])
+PD.ctrl.zscore.data <- join_all(df,by="Gene",match = "all") %>% column_to_rownames("Gene")
+PD.ctrl.zscore.data[is.na(PD.ctrl.zscore.data)] <- 0
+# Compile pheno
+df <- list(GSE172409.seq.data[["dis.data"]][["meta"]], GSE135743.seq.data[["dis.data"]][["meta"]],
+           GSE120746.seq.data[["dis.data"]][["meta"]], GSE68719.seq.data[["dis.data"]][["meta"]],
+           GSE49036.seq.data[["dis.data"]][["meta"]]) #GSE43490.seq.data[["dis.data"]][["meta"]],
+           #GSE28894.seq.data[["dis.data"]][["meta"]])
+PD.dis.pheno <- do.call("rbind", df) %>% column_to_rownames("ID") # rbind list
+PD.dis.pheno$Disease <- "Parkinson's Disease" 
+
+# Plot heatmap to evaluate outlier dataset
+set.seed(122)
+PD.hm <- pheatmap(PD.dis.zscore.data, show_rownames = T, show_colnames = F, kmeans_k = 5,
+               annotation_col = PD.dis.pheno)
+# From the heatmap, PD6 and PD7 is outlier, were excluded from downstream analysis
+
+
+######### GSEA ###################
+# Compile GSEA info for all PD data
+PD.gsea <- list() # create an empty list
+zz <- c("GSE68719","GSE172409","GSE135743","GSE120746","GSE28894","GSE43490","GSE49036")
+for (i in zz){
+  k <- go.prep(i)
+  PD.gsea[[id = i]] <- k}
+# Get list of all GSEA terms for PD
+df <- list(PD.gsea[["GSE68719"]],PD.gsea[["GSE172409"]],PD.gsea[["GSE120746"]],PD.gsea[["GSE28894"]],PD.gsea[["GSE104704"]])
+PD.gsea.terms <- do.call("rbind", df)
+PD.gsea.terms <- PD.gsea.terms[!duplicated(PD.gsea.terms$Description),]  %>% dplyr::select(c(1))
+
+#################################
+
+```
+
+
+## Glioma data analysis
+
+```{r}
+# create an empty list
+df <- list()
+# make sure data with the most genes is first
+zz <- c("GSE151352","GSE22866","GSE4290","GSE108474","GSE147352","GSE109857","GSE116520","GSE12657")
+for (i in zz){
+  k <- get(paste0(i,'.seq.data'))
+  k <- data.frame(Gene = k[["sig.degs"]][["Gene"]])
+  df[[i]] <- k}
+df <- do.call("rbind", df) # rbind list
+df <- data.frame(Gene = df[!duplicated(df$Gene),]) %>% remove_rownames()
+Glioma.degs <- data.frame(Gene = df[!duplicated(df$Gene),])
+
+# Prep z-scores for disease datasets
+#Glioma1 - disease
+kkk <- GSE151352.seq.data[["meta"]] %>% rownames_to_column("ID")
+colnames(kkk) <- c("ID","Condition")
+kkk <- kkk %>% dplyr::filter(Condition == "DIS")
+kkk$Condition <- gsub("DIS", "Glioma1", kkk$Condition)
+cts <- Zscore(GSE151352.seq.data[["counts"]]) 
+idx <- kkk[[1]]
+cts  <- cts[, idx] %>% rownames_to_column("Gene")
+cts <- merge(Glioma.degs, cts,by.y="Gene",all=F)
+cts <- cts[!duplicated(cts$Gene),] %>% remove_rownames 
+GSE151352.seq.data[["dis.data"]] <- list(counts = cts, meta = kkk)
+#Glioma1 - CTRL
+kkk <- GSE151352.seq.data[["meta"]] %>% rownames_to_column("ID")
+colnames(kkk) <- c("ID","Condition")
+kkk <- kkk %>% dplyr::filter(Condition == "CTRL")
+kkk$Condition <- gsub("CTRL", "Glioma1", kkk$Condition)
+cts <- Zscore(GSE151352.seq.data[["counts"]]) 
+idx <- kkk[[1]]
+cts  <- cts[, idx] %>% rownames_to_column("Gene")
+cts <- merge(Glioma.degs, cts,by.y="Gene",all=F)
+cts <- cts[!duplicated(cts$Gene),] %>% remove_rownames 
+GSE151352.seq.data[["ctrl.data"]] <- list(counts = cts, meta = kkk)
+#Glioma2-7
+GSE22866.seq.data[["dis.data"]] = data.prep("GSE22866", is.arrays = FALSE,disease = "Glioma2",category = "DIS")
+GSE22866.seq.data[["ctrl.data"]] = data.prep("GSE22866", is.arrays = FALSE,disease = "Glioma2",category = "CTRL")
+
+GSE4290.seq.data[["dis.data"]] = data.prep("GSE4290", is.arrays = TRUE,disease = "Glioma3", anno_col = "Gene Symbol",category = "DIS")
+GSE4290.seq.data[["ctrl.data"]] = data.prep("GSE4290", is.arrays = TRUE,disease = "Glioma3", anno_col = "Gene Symbol",category = "CTRL")
+
+GSE108474.seq.data[["dis.data"]] = data.prep("GSE108474", is.arrays = TRUE,disease = "Glioma4", anno_col = "Gene Symbol",category = "DIS")
+GSE108474.seq.data[["ctrl.data"]] = data.prep("GSE108474", is.arrays = TRUE,disease = "Glioma4", anno_col = "Gene Symbol",category = "CTRL")
+
+GSE147352.seq.data[["dis.data"]] = data.prep("GSE147352", is.arrays = FALSE,disease = "Glioma5",category = "DIS")
+GSE147352.seq.data[["ctrl.data"]] = data.prep("GSE147352", is.arrays = FALSE,disease = "Glioma5",category = "CTRL")
+
+GSE109857.seq.data[["dis.data"]] = data.prep("GSE109857", is.arrays = TRUE,disease = "Glioma6", anno_col = "GENE_SYMBOL",category = "DIS")
+GSE109857.seq.data[["ctrl.data"]] = data.prep("GSE109857", is.arrays = TRUE,disease = "Glioma6", anno_col = "GENE_SYMBOL",category = "CTRL")
+
+GSE12657.seq.data[["dis.data"]] = data.prep("GSE12657", is.arrays = TRUE,disease = "Glioma7", anno_col = "Gene Symbol",category = "DIS")
+GSE12657.seq.data[["ctrl.data"]] = data.prep("GSE12657", is.arrays = TRUE,disease = "Glioma7", anno_col = "Gene Symbol",category = "CTRL")
+
+# Compile dis zscore matrix
+df <- list(GSE151352.seq.data[["dis.data"]][["counts"]],GSE22866.seq.data[["dis.data"]][["counts"]],
+           GSE4290.seq.data[["dis.data"]][["counts"]],
+           GSE108474.seq.data[["dis.data"]][["counts"]],GSE147352.seq.data[["dis.data"]][["counts"]],
+           GSE109857.seq.data[["dis.data"]][["counts"]],GSE12657.seq.data[["dis.data"]][["counts"]])
+Glioma.dis.zscore.data <- join_all(df,by="Gene",match = "all") %>% column_to_rownames("Gene")
+Glioma.dis.zscore.data[is.na(Glioma.dis.zscore.data)] <- 0
+# Compile ctrl zscore matrix
+df <- list(GSE151352.seq.data[["ctrl.data"]][["counts"]],GSE22866.seq.data[["ctrl.data"]][["counts"]],
+           GSE4290.seq.data[["ctrl.data"]][["counts"]],
+           GSE108474.seq.data[["ctrl.data"]][["counts"]],GSE147352.seq.data[["ctrl.data"]][["counts"]],
+           GSE109857.seq.data[["ctrl.data"]][["counts"]],GSE12657.seq.data[["ctrl.data"]][["counts"]])
+Glioma.ctrl.zscore.data <- join_all(df,by="Gene",match = "all") %>% column_to_rownames("Gene")
+Glioma.ctrl.zscore.data[is.na(Glioma.ctrl.zscore.data)] <- 0
+# Compile pheno
+df <- list(GSE151352.seq.data[["dis.data"]][["meta"]],GSE22866.seq.data[["dis.data"]][["meta"]],GSE4290.seq.data[["dis.data"]][["meta"]],
+           GSE108474.seq.data[["dis.data"]][["meta"]],GSE147352.seq.data[["dis.data"]][["meta"]],
+           GSE109857.seq.data[["dis.data"]][["meta"]],GSE12657.seq.data[["dis.data"]][["meta"]])
+Glioma.dis.pheno <- do.call("rbind", df) %>% column_to_rownames("ID") # rbind list
+Glioma.dis.pheno$Disease <- "Glioma" 
+
+# Plot heatmap to evaluate outlier dataset
+set.seed(129)
+Glioma.hm <- pheatmap(Glioma.dis.zscore.data, show_rownames = T, show_colnames = F, kmeans_k = 5,
+               annotation_col = Glioma.dis.pheno)
+
+######### GSEA ###################
+# Compile GSEA info for all Glioma data
+Glioma.gsea <- list() # create an empty list
+zz <- c("GSE151352","GSE22866","GSE4290","GSE108474","GSE147352","GSE109857","GSE116520","GSE12657")
+for (i in zz){
+  k <- go.prep(i)
+  Glioma.gsea[[id = i]] <- k}
+# Get list of all GSEA terms for Glioma
+df <- list(Glioma.gsea[["GSE151352"]],Glioma.gsea[["GSE22866"]],Glioma.gsea[["GSE4290"]],Glioma.gsea[["GSE147352"]],
+           Glioma.gsea[["GSE109857"]],Glioma.gsea[["GSE116520"]],Glioma.gsea[["GSE12657"]])
+Glioma.gsea.terms <- do.call("rbind", df)
+Glioma.gsea.terms <- Glioma.gsea.terms[!duplicated(Glioma.gsea.terms$Description),] %>% dplyr::select(c(1))
+
+#################################
+
+```
+
+
+# GSEA Profiling
+
+```{r}
+######### GSEA #########
+# Venn diagram for gsea terms
+data <- list(Glioma = Glioma.gsea.terms$Description,  AD = AD.gsea.terms$Description, PD = PD.gsea.terms$Description)
+gsea.venn <- ggvenn(data, show_percentage = F, fill_alpha = 0.8, text_size = 6, 
+                  set_name_size = 8, fill_color = c("#440154FF", "#35B779FF", "gray"))
+
+# add an id colum for filtering purposes below
+AD.gsea.terms$AD <- 1
+PD.gsea.terms$PD <- 2
+Glioma.gsea.terms$Glioma <- 3
+#Subset specific intersecting genes: #subset genes in all 3 states
+gsea.venn.df <- join_all(list(Glioma.gsea.terms, AD.gsea.terms, PD.gsea.terms), by="Description", match="all")
+gsea.venn.df[is.na(gsea.venn.df)] <- 0
+Glioma.AD.PD.gsea.terms <- gsea.venn.df %>% filter((Glioma == 3 & AD == 1 & PD == 2))
+Glioma.AD.PD.gsea.terms <- Glioma.AD.PD.gsea.terms[!duplicated(Glioma.AD.PD.gsea.terms$Description),] %>% dplyr::select(c(1))
+#Glioma only
+Glioma.only.gsea.terms <- gsea.venn.df %>% filter((Glioma == 3 & AD == 0 & PD == 0))
+Glioma.only.gsea.terms <- Glioma.only.gsea.terms[!duplicated(Glioma.only.gsea.terms$Description),] %>% dplyr::select(c(1)) 
+#AD only
+gsea.venn.df <- join_all(list(AD.gsea.terms,Glioma.gsea.terms, PD.gsea.terms), by="Description", match="all")
+gsea.venn.df[is.na(gsea.venn.df)] <- 0
+AD.only.gsea.terms <- gsea.venn.df %>% filter((Glioma == 0 & AD == 1 & PD == 0))
+AD.only.gsea.terms <- AD.only.gsea.terms[!duplicated(AD.only.gsea.terms$Description),] %>% dplyr::select(c(1))
+#PD only
+gsea.venn.df <- join_all(list(PD.gsea.terms,AD.gsea.terms,Glioma.gsea.terms), by="Description", match="all")
+gsea.venn.df[is.na(gsea.venn.df)] <- 0
+PD.only.gsea.terms <- gsea.venn.df %>% filter((Glioma == 0 & AD == 0 & PD == 2))
+PD.only.gsea.terms <- PD.only.gsea.terms[!duplicated(PD.only.gsea.terms$Description),] %>% dplyr::select(c(1))
+#Glioma.AD
+Glioma.AD.gsea.terms <- merge(AD.gsea.terms,Glioma.gsea.terms, by.y="Description", all=T) %>% drop_na()
+Glioma.AD.gsea.terms <- Glioma.AD.gsea.terms[!duplicated(Glioma.AD.gsea.terms$Description),] %>% dplyr::select(c(1))
+#Glioma.PD
+Glioma.PD.gsea.terms <- merge(PD.gsea.terms,Glioma.gsea.terms, by.y="Description", all=T) %>% drop_na()
+Glioma.PD.gsea.terms <- Glioma.PD.gsea.terms[!duplicated(Glioma.PD.gsea.terms$Description),] %>% dplyr::select(c(1))
+#AD.PD
+AD.PD.gsea.terms <- merge(PD.gsea.terms,AD.gsea.terms, by.y="Description", all=T) %>% drop_na()
+AD.PD.gsea.terms <- AD.PD.gsea.terms[!duplicated(AD.PD.gsea.terms$Description),] %>% dplyr::select(c(1))
+
+#############################
+
+
+######### GSEA enrichment visualization for subsetted terms #########
+######## AD only ##########
+df1 <- list()
+zz <- c('GSE5281','GSE125583','GSE193438','GSE153873','GSE104704',
+        'GSE15222','GSE122063','GSE132903','GSE48350','GSE110226',
+       'GSE39420','GSE109887','GSE138260')
+for (i in zz){
+  df <- AD.gsea
+  df1[[i]] <- merge(AD.only.gsea.terms, df[[i]], by.y="Description",all=F)}
+AD.only.gsea.plt.df <- do.call("rbind", df1)
+AD.only.gsea.plt.df <- AD.only.gsea.plt.df[!duplicated(AD.only.gsea.plt.df$Description),]
+AD.only.gsea.plt.df <- AD.only.gsea.plt.df[order(AD.only.gsea.plt.df$NES),]
+df <- rbind((head(AD.only.gsea.plt.df,n=10L)),(tail(AD.only.gsea.plt.df,n=10L)))
+AD.only.gsea.plt <- ggplot(df, aes(x=reorder(Description, -NES), y=NES)) + 
+  geom_bar(stat = "identity",alpha=0.1) +
+    geom_segment(aes(x=Description, xend=Description, y=0, yend=NES),size=1.5,color="#35B779FF") +
+    geom_point(size=5, alpha=0.5,color="#35B779FF") + xlab("") + ylab("Normalized enrichmnent score") + 
+  theme_classic(base_size = 20) + coord_flip()
+
+######## PD only ##########
+df1 <- list()
+zz <- c("GSE68719","GSE172409","GSE135743","GSE120746","GSE28894","GSE43490","GSE49036")
+for (i in zz){
+  df <- PD.gsea
+  df1[[i]] <- merge(PD.only.gsea.terms, df[[i]], by.y="Description",all=F)}
+PD.only.gsea.plt.df <- do.call("rbind", df1)
+PD.only.gsea.plt.df <- PD.only.gsea.plt.df[!duplicated(PD.only.gsea.plt.df$Description),]
+PD.only.gsea.plt.df <- PD.only.gsea.plt.df[order(PD.only.gsea.plt.df$NES),]
+df <- rbind((head(PD.only.gsea.plt.df,n=10L)),(tail(PD.only.gsea.plt.df,n=10L)))
+PD.only.gsea.plt <- ggplot(df, aes(x=reorder(Description, -NES), y=NES)) + 
+  geom_bar(stat = "identity",alpha=0.1) +
+    geom_segment(aes(x=Description, xend=Description, y=0, yend=NES),size=1.5,color="gray") +
+    geom_point(size=5, alpha=0.5,color="gray") + xlab("") + ylab("Normalized enrichmnent score") + 
+  theme_classic(base_size = 20) + coord_flip()
+
+######## Glioma only ##########
+df1 <- list()
+zz <- c("GSE151352","GSE22866","GSE4290","GSE108474","GSE147352","GSE109857","GSE116520","GSE12657")
+for (i in zz){
+  df <- Glioma.gsea
+  df1[[i]] <- merge(Glioma.only.gsea.terms, df[[i]], by.y="Description",all=F)}
+Glioma.only.gsea.plt.df <- do.call("rbind", df1)
+Glioma.only.gsea.plt.df <- Glioma.only.gsea.plt.df[!duplicated(Glioma.only.gsea.plt.df$Description),]
+Glioma.only.gsea.plt.df <- Glioma.only.gsea.plt.df[order(Glioma.only.gsea.plt.df$NES),]
+df <- rbind((head(Glioma.only.gsea.plt.df,n=10L)),(tail(Glioma.only.gsea.plt.df,n=10L)))
+Glioma.only.gsea.plt <- ggplot(df, aes(x=reorder(Description, -NES), y=NES)) + 
+  geom_bar(stat = "identity",alpha=0.1) +
+    geom_segment(aes(x=Description, xend=Description, y=0, yend=NES),size=1.5,color="#440154FF") +
+    geom_point(size=5, alpha=0.5,color="#440154FF") + xlab("") + ylab("Normalized enrichmnent score") + 
+  theme_classic(base_size = 20) + coord_flip()
+
+######## Shared: Glioma vs AD ##########
+# AD
+df1 <- list()
+zz <- c('GSE5281','GSE125583','GSE193438','GSE153873','GSE104704',
+        'GSE15222','GSE122063','GSE132903','GSE48350','GSE110226',
+       'GSE39420','GSE109887','GSE138260')
+for (i in zz){
+  df <- AD.gsea
+  df[[i]] <- merge(Glioma.AD.gsea.terms, df[[i]], by.y="Description",all=F)
+  df1[[i]] <- df[[i]]}
+# Glioma
+df2 <- list()
+zz <- c("GSE151352","GSE22866","GSE4290","GSE108474","GSE147352","GSE109857","GSE116520","GSE12657")
+for (i in zz){
+  df <- Glioma.gsea
+  df[[i]] <- merge(Glioma.AD.gsea.terms, df[[i]], by.y="Description",all=F)
+  df2[[i]] <- df[[i]]}
+#Combine
+df1 <- do.call("rbind", df1) %>% rename("AD"="NES")
+df2 <- do.call("rbind", df2) %>% rename("Glioma"="NES")
+Glioma.AD.gsea.plt.df <- merge(df1,df2, by="Description",all=T)
+Glioma.AD.gsea.plt.df <- Glioma.AD.gsea.plt.df[!duplicated(Glioma.AD.gsea.plt.df$Description),]
+#Plot heatamap
+df <- Glioma.AD.gsea.plt.df %>% remove_rownames %>% column_to_rownames(var="Description")
+Glioma.AD.gsea.plt.df.hm <- pheatmap(t(df), angle_col = 0, show_colnames = F, color = viridis(20),
+         cluster_rows = F,cluster_cols = T, show_rownames = T, fontsize = 14)
+#Plot heatmap for opposite enriched terms
+Glioma.AD.gsea.opposite <- Glioma.AD.gsea.plt.df %>% 
+  filter((Glioma > 0 & AD < 0) | (Glioma < 0 & AD > 0))
+Glioma.AD.gsea.opposite <- Glioma.AD.gsea.opposite[order(Glioma.AD.gsea.opposite$Glioma),]
+df <- rbind((head(Glioma.AD.gsea.opposite,n=15L)),(tail(Glioma.AD.gsea.opposite,n=15L))) %>% 
+  remove_rownames() %>% column_to_rownames("Description")
+set.seed(139)
+Glioma.AD.gsea.opposite.hm <- pheatmap(df, angle_col = 0, show_colnames = T, color = viridis(20),
+         cluster_rows = T,cluster_cols = F, show_rownames = T, fontsize = 14)
+
+######## Shared: Glioma vs PD ##########
+# PD
+df1 <- list()
+zz <- c("GSE68719")#,"GSE172409","GSE135743","GSE120746","GSE28894","GSE43490","GSE49036")
+for (i in zz){
+  df <- PD.gsea
+  df[[i]] <- merge(Glioma.PD.gsea.terms, df[[i]], by.y="Description",all=F)
+  df1[[i]] <- df[[i]]}
+# Glioma
+df2 <- list()
+zz <- c("GSE151352","GSE22866","GSE4290","GSE108474","GSE147352","GSE109857","GSE116520","GSE12657")
+for (i in zz){
+  df <- Glioma.gsea
+  df[[i]] <- merge(Glioma.PD.gsea.terms, df[[i]], by.y="Description",all=F)
+  df2[[i]] <- df[[i]]}
+#Combine
+df1 <- do.call("rbind", df1) %>% rename("PD"="NES")
+df2 <- do.call("rbind", df2) %>% rename("Glioma"="NES")
+Glioma.PD.gsea.plt.df <- merge(df1,df2, by="Description",all=T)
+Glioma.PD.gsea.plt.df <- Glioma.PD.gsea.plt.df[!duplicated(Glioma.PD.gsea.plt.df$Description),]
+#Plot heatamap
+df <- Glioma.PD.gsea.plt.df %>% remove_rownames %>% column_to_rownames(var="Description") %>% drop_na()
+set.seed(157)
+Glioma.PD.gsea.plt.df.hm <- pheatmap(t(df), angle_col = 0, show_colnames = F, color = viridis(20),
+         cluster_rows = F,cluster_cols = T, show_rownames = T, fontsize = 14)
+
+# No opposite enriched
+
+#Plot heatmap for opposite enriched terms
+#Glioma.PD.gsea.opposite <- Glioma.PD.gsea.plt.df %>% 
+#  filter((Glioma > 0 & PD < 0) | (Glioma < 0 & PD > 0))
+#Glioma.PD.gsea.opposite <- Glioma.PD.gsea.opposite[order(Glioma.PD.gsea.opposite$Glioma),]
+#df <- Glioma.PD.gsea.opposite  %>% 
+#  remove_rownames() %>% column_to_rownames("Description")
+#set.seed(141)
+#Glioma.PD.gsea.opposite.hm <- pheatmap(df, angle_col = 0, show_colnames = T, color = viridis(20),
+#         cluster_rows = T,cluster_cols = F, show_rownames = T, fontsize = 14)
+
+######## Shared: Glioma,AD,PD ##########
+# AD
+df1 <- list()
+zz <- c('GSE5281','GSE125583','GSE193438','GSE153873','GSE104704',
+        'GSE15222','GSE122063','GSE132903','GSE48350','GSE110226',
+       'GSE39420','GSE109887','GSE138260')
+for (i in zz){
+  df <- AD.gsea
+  df[[i]] <- merge(Glioma.AD.PD.gsea.terms, df[[i]], by.y="Description",all=F)
+  df1[[i]] <- df[[i]]}
+# PD
+df2 <- list()
+zz <- c("GSE68719","GSE172409","GSE135743","GSE120746","GSE28894","GSE43490","GSE49036")
+for (i in zz){
+  df <- PD.gsea
+  df[[i]] <- merge(Glioma.AD.PD.gsea.terms, df[[i]], by.y="Description",all=F)
+  df2[[i]] <- df[[i]]}
+# Glioma
+df3 <- list()
+zz <- c("GSE151352","GSE22866","GSE4290","GSE108474","GSE147352","GSE109857","GSE116520","GSE12657")
+for (i in zz){
+  df <- Glioma.gsea
+  df[[i]] <- merge(Glioma.AD.PD.gsea.terms, df[[i]], by.y="Description",all=F)
+  df3[[i]] <- df[[i]]}
+#Combine
+df1 <- do.call("rbind", df1) %>% rename("AD"="NES")
+df2 <- do.call("rbind", df2) %>% rename("PD"="NES")
+df3 <- do.call("rbind", df3) %>% rename("Glioma"="NES")
+Glioma.AD.PD.gsea.plt.df <- join_all(list(df1,df2,df3), by="Description",match = "all")
+Glioma.AD.PD.gsea.plt.df <- Glioma.AD.PD.gsea.plt.df[!duplicated(Glioma.AD.PD.gsea.plt.df$Description),]
+#Plot heatamap
+df <- Glioma.AD.PD.gsea.plt.df %>% remove_rownames %>% column_to_rownames(var="Description")
+Glioma.AD.PD.gsea.plt.df.hm <- pheatmap(t(df), angle_col = 0, show_colnames = F, color = viridis(20),
+         cluster_rows = F,cluster_cols = T, show_rownames = T, fontsize = 14)
+
+#####################
+```
+
+# DEG Profiling
+
+```{r}
+######### DEGs #########
+# Venn diagram for genes
+data <- list(Glioma = Glioma.degs$Gene,  AD = AD.degs$Gene, PD = PD.degs$Gene)
+deg.venn <- ggvenn(data, show_percentage = F, fill_alpha = 0.8, text_size = 6, 
+                   set_name_size = 8, fill_color = c("#440154FF", "#35B779FF", "gray")) 
+# add an id colum for filtering purposes below
+AD.degs$AD <- 1
+PD.degs$PD <- 2
+Glioma.degs$Glioma <- 3
+#Subset specific intersecting genes: #subset genes in all 3 states
+deg.venn.df <- join_all(list(Glioma.degs, AD.degs, PD.degs), by="Gene", match="all")
+deg.venn.df[is.na(deg.venn.df)] <- 0
+Glioma.AD.PD.degs <- deg.venn.df %>% filter((Glioma == 3 & AD == 1 & PD == 2))
+Glioma.AD.PD.degs <- Glioma.AD.PD.degs[!duplicated(Glioma.AD.PD.degs$Gene),] %>% dplyr::select(c(1))
+#Glioma only
+# Glioma.only.degs <- deg.venn.df %>% filter((Glioma == 3 & AD == 0 & PD == 0))
+# Glioma.only.degs <- Glioma.only.degs[!duplicated(Glioma.only.degs$SYMBOL),] %>% dplyr::select(c(1)) #%>% rename("Gene" = "SYMBOL")
+# #AD only
+# deg.venn.df <- join_all(list(AD.degs,Glioma.degs, PD.degs), by="SYMBOL", match="all")
+# deg.venn.df[is.na(deg.venn.df)] <- 0
+# AD.only.degs <- deg.venn.df %>% filter((Glioma == 0 & AD == 1 & PD == 0))
+# AD.only.degs <- AD.only.degs[!duplicated(AD.only.degs$SYMBOL),] %>% dplyr::select(c(1)) #%>% rename("Gene" = "SYMBOL")
+# #PD only
+# deg.venn.df <- join_all(list(PD.degs,AD.degs,Glioma.degs), by="SYMBOL", match="all")
+# deg.venn.df[is.na(deg.venn.df)] <- 0
+# PD.only.degs <- deg.venn.df %>% filter((Glioma == 0 & AD == 0 & PD == 2))
+# PD.only.degs <- PD.only.degs[!duplicated(PD.only.degs$SYMBOL),] %>% dplyr::select(c(1)) #%>% rename("Gene" = "SYMBOL")
+
+# Compile all z-score data
+df1 <- Glioma.dis.zscore.data %>% rownames_to_column("Gene")
+df2 <- AD.dis.zscore.data %>% rownames_to_column("Gene")
+df3 <- PD.dis.zscore.data %>% rownames_to_column("Gene")
+Glioma.AD.PD.dis.zscore.data <- join_all(list(df1,df2,df3), by="Gene",match = "all",type = "inner")
+
+# Compile pheno for all z-score data
+df1 <- Glioma.dis.pheno %>% rownames_to_column("ID")
+df2 <- AD.dis.pheno %>% rownames_to_column("ID")
+df3 <- PD.dis.pheno %>% rownames_to_column("ID")
+Glioma.AD.PD.dis.pheno <- rbind(df1,df2,df3) %>% column_to_rownames("ID") %>% dplyr::select(c(2))
+
+# Subset zscore data of genes shared across
+df <- merge(Glioma.AD.PD.degs, Glioma.AD.PD.dis.zscore.data, by.y="Gene",all=F) 
+Glioma.AD.PD.dis.shared.zscore.data <- df %>% dplyr::select(-c(1)) 
+rownames(Glioma.AD.PD.dis.shared.zscore.data) <- df$Gene
+
+#Plot heatmap for shared genes
+set.seed(684)
+Glioma.AD.PD.dis.shared.zscore.hm <- pheatmap(Glioma.AD.PD.dis.shared.zscore.data, angle_col = 0, show_colnames = F, 
+                                              color = viridis(20),cluster_rows = T, annotation_col = Glioma.AD.PD.dis.pheno,
+                                              cluster_cols = F,show_rownames = T, fontsize = 14, kmeans_k = 3)
+#Subset cluster 1
+clus <- as.data.frame(Glioma.AD.PD.dis.shared.zscore.hm[["kmeans"]][["cluster"]])
+clus.df <- clus %>% filter(clus$`Glioma.AD.PD.dis.shared.zscore.hm[["kmeans"]][["cluster"]]` == 1)  %>% 
+  rownames_to_column("Gene") %>% dplyr::select(-c(2))
+
+exprs.zscore <- Glioma.AD.PD.dis.shared.zscore.data %>% rownames_to_column("Gene")
+df <- merge(exprs.zscore,clus.df,by.y="Gene", all=F) %>% remove_rownames %>% 
+  column_to_rownames(var="Gene") 
+df[is.na(df)] = 0
+set.seed(697)
+Glioma.AD.PD.dis.opposite.zscore.hm <- pheatmap(df, angle_col = 0, show_colnames = F, 
+                                              color = viridis(20),cluster_rows = T, 
+                                              annotation_col = Glioma.AD.PD.dis.pheno,
+                                              cluster_cols = F,show_rownames = F, fontsize = 14)
+# Get degs with opposing expression
+Glioma.AD.PD.dis.opposite.degs <- clus.df
+
+#############################
+
+```
+
+# Glioma survival and opposite genes
+
+```{r}
+## Prepare TCGA expression  and survival data
+setwd(paste0(workPath, "mutation"))
+# Prepare LGG data
+lgg.tcga <- read.table("lgg_mrna_Zscore_tcga.txt", header = T) %>% drop_na() %>% 
+  dplyr::select(-c("Entrez_Gene_Id")) %>% rename(Gene = Hugo_Symbol)
+lgg.tcga <- lgg.tcga[!duplicated(lgg.tcga$Gene),]
+lgg.tcga <- melt(lgg.tcga, id="Gene")
+colnames(lgg.tcga) <- c("Gene", "PATIENT_ID", "Zscore")
+lgg.tcga$PATIENT_ID <- sub("\\.[^.]*$", "",lgg.tcga$PATIENT_ID)
+lgg.tcga$Expression[lgg.tcga$Zscore > 1.0] = "Increased" 
+lgg.tcga$Expression[lgg.tcga$Zscore < -1.0] = "Decreased"
+lgg.tcga$Expression[lgg.tcga$Zscore > -1.0 & lgg.tcga$Zscore < 1.0] = "Normal"
+#lgg.tcga <- lgg.tcga %>% filter(Expression != "NA") %>% dplyr::select(-c("Zscore"))
+lgg.tcga <- lgg.tcga  %>% dplyr::select(-c("Zscore"))
+#clinical data
+lgg.tcga.clin <- read.delim("lgg_tcga_clinical_patient.txt", header = T, skip = 4) %>% 
+  dplyr::select("PATIENT_ID","AGE", "OS_MONTHS", "OS_STATUS", "HISTOLOGICAL_DIAGNOSIS")
+lgg.tcga.clin$OS_MONTHS <- as.numeric(as.character(lgg.tcga.clin$OS_MONTHS))
+lgg.tcga.clin$OS_STATUS <- sub("\\:[^.]*$", "",lgg.tcga.clin$OS_STATUS)
+lgg.tcga.clin <- drop_na(lgg.tcga.clin)
+# Prepare GBM data
+gbm.tcga <- read.table("gbm_mrna_Zscore_tcga.txt", header = T) %>% drop_na() %>% 
+  dplyr::select(-c("Entrez_Gene_Id")) %>% rename(Gene = Hugo_Symbol)
+gbm.tcga <- gbm.tcga[!duplicated(gbm.tcga$Gene),]
+gbm.tcga <- melt(gbm.tcga, id="Gene")
+colnames(gbm.tcga) <- c("Gene", "PATIENT_ID", "Zscore")
+gbm.tcga$PATIENT_ID <- sub("\\.[^.]*$", "",gbm.tcga$PATIENT_ID)
+gbm.tcga$Expression[gbm.tcga$Zscore > 1] = "Increased" 
+gbm.tcga$Expression[gbm.tcga$Zscore < -1] = "Decreased"
+gbm.tcga$Expression[gbm.tcga$Zscore > -1 & gbm.tcga$Zscore < 1 ] = "Normal"
+#gbm.tcga <- gbm.tcga %>% filter(Expression != "NA") %>% dplyr::select(-c("Zscore"))
+gbm.tcga <- gbm.tcga  %>% dplyr::select(-c("Zscore"))
+#clinical data
+gbm.tcga.clin <- read.delim("gbm_tcga_clinical_patient.txt", header = T, skip = 4) %>% 
+  dplyr::select("PATIENT_ID","AGE", "OS_MONTHS", "OS_STATUS", "HISTOLOGICAL_DIAGNOSIS") %>% 
+  filter(HISTOLOGICAL_DIAGNOSIS != "Treated primary GBM") %>% dplyr::select(-c(HISTOLOGICAL_DIAGNOSIS))
+gbm.tcga.clin$HISTOLOGICAL_DIAGNOSIS = "Glioblastoma"
+gbm.tcga.clin$OS_MONTHS <- as.numeric(as.character(gbm.tcga.clin$OS_MONTHS))
+gbm.tcga.clin$OS_STATUS <- sub("\\:[^.]*$", "",gbm.tcga.clin$OS_STATUS)
+gbm.tcga.clin <- drop_na(gbm.tcga.clin)
+
+# Merge lgg and gbm
+clin.data <- rbind(lgg.tcga.clin, gbm.tcga.clin) %>% rename(Class = HISTOLOGICAL_DIAGNOSIS)
+clin.data[clin.data == "Astrocytoma"] <- "LGG-Astrocytoma"
+clin.data[clin.data == "Oligodendroglioma"] <- "LGG-Oligodendroglioma"
+clin.data[clin.data == "Oligoastrocytoma"] <- "LGG-Oligoastrocytoma"
+expr.data <- rbind(lgg.tcga,gbm.tcga)
+
+## Get cox p-values for each opposing deg
+# Get data for the opposing deg
+cc <- merge(expr.data, Glioma.AD.PD.dis.opposite.degs, by = "Gene", all =F) %>% dplyr::select(c(Gene))
+cc <- cc[!duplicated(cc$Gene),]
+# define function to calc cox-pvalues for each gene, adjusted for by age and glioma class
+Gene <- vector(mode = 'character', length = length(cc))
+p1 <- vector(mode = 'numeric', length = length(cc))
+p2 <- vector(mode = 'numeric', length = length(cc))
+p3 <- vector(mode = 'numeric', length = length(cc))
+p4 <- vector(mode = 'numeric', length = length(cc))
+for (gene in cc){ 
+        OSdata <- filter(expr.data, Gene == gene) %>% dplyr::select(-c(1))
+        OSdata$PATIENT_ID <- gsub('[.]', '-', OSdata$PATIENT_ID)
+        OS.data <- merge(OSdata, clin.data, by.y="PATIENT_ID", all=F)
+        OS.data$Expression <- factor(OS.data$Expression, levels = c("Increased", "Decreased", "Normal"))
+        surv = Surv(time = OS.data$OS_MONTHS, event = as.numeric(OS.data$OS_STATUS))
+        fit <- survfit(formula = surv ~ Expression, data = OS.data)
+        cox_reg_model <- coxph(formula = surv ~ Expression + AGE + Class, data = OS.data)
+        fit.p <- as.data.frame(summary(emmeans(cox_reg_model,pairwise~Expression)$contrasts,type="response")) %>% 
+          dplyr::select(contrast,ratio,p.value) %>% rename("hazard ratio"="ratio")   
+          a <- fit.p %>% filter(contrast == "Increased / Decreased")
+          b <- fit.p %>% filter(contrast == "Increased / Normal")
+          c <- fit.p %>% filter(contrast == "Decreased / Normal")
+          Gene[gene] <- gene
+          p1[gene] <- a$p.value
+          p2[gene] <- a$`hazard ratio`
+          p3[gene] <- b$`hazard ratio`
+          p4[gene] <- c$`hazard ratio`}
+
+# get cox p-values
+cox.pval.opposite.degs <- data.frame(Gene,p1,p2,p3,p4) %>% tail(n=621L) %>% filter((p1 < 0.1)) %>% 
+  filter((p2 < 0.7)) %>% filter((p4 > 1.5)) %>% filter((p3 < 1)) 
+
+```
+
+```{r, message=FALSE,warning=FALSE,fig.width=10,fig.height=8}
+## Plot survival plots for GOI
+cc <- as.character(cox.pval.opposite.degs$Gene)
+for (gene in cc){
+    ast <- mysurv("LGG-Astrocytoma")
+    olias<- mysurv("LGG-Oligoastrocytoma")
+    oliden<- mysurv("LGG-Oligodendroglioma")
+    gbm<- mysurv("Glioblastoma")
+    x <- ggarrange(ast$plot,olias$plot,oliden$plot,gbm$plot, ncol = 4, common.legend = T, legend = "right")
+    print(x)}
+
+
+```
+
+
+```{r}
+## Getting GOIs
+goi <- data.frame(Gene = c("ZHX2","ZCCHC24", "GRIA2", "FOXO4", "CNRIP1", "APC2", "ABHD4"))
+
+# Plot survplots for these GOI 
+cc <- as.character(goi$Gene)
+for (gene in cc){
+    ast <- mysurv("LGG-Astrocytoma")
+    olias<- mysurv("LGG-Oligoastrocytoma")
+    oliden<- mysurv("LGG-Oligodendroglioma")
+    gbm<- mysurv("Glioblastoma")
+    x <- ggarrange(ast$plot,olias$plot,oliden$plot,gbm$plot, ncol = 4, common.legend = T, legend = "top")
+    print(x)}
+
+# Plot heatmap for these GOI
+df <- merge(exprs.zscore,goi,by.y="Gene", all=F) %>% remove_rownames %>% 
+  column_to_rownames(var="Gene") 
+df[is.na(df)] = 0
+set.seed(834)
+goi.zscore.hm <- pheatmap(df, angle_col = 0, show_colnames = F, #kmeans_k = 10,
+                            color = viridis(20),cluster_rows = T, 
+                            annotation_col = Glioma.AD.PD.dis.pheno,
+                            cluster_cols=T,show_rownames = T, fontsize = 14)
+```
+
+```{r}
+######## Plot box-plots of z-scores for ctrl,ad,pd,glioma #########
+# prep dis data
+df1 <- AD.dis.zscore.data %>% rownames_to_column("Gene") 
+df1 <- melt(df1,id="Gene",value.name = "value")
+df1$variable = "AD"
+df2 <- PD.dis.zscore.data %>% rownames_to_column("Gene") 
+df2 <- melt(df2,id="Gene",value.name = "value")
+df2$variable = "PD"
+df3 <- Glioma.dis.zscore.data %>% rownames_to_column("Gene") 
+df3 <- melt(df3,id="Gene",value.name = "value")
+df3$variable = "Glioma"
+dis.data <- merge(goi,(rbind(df1,df2,df3)),by.y="Gene")
+# prep ctrl data
+df1 <- AD.ctrl.zscore.data %>% rownames_to_column("Gene") 
+df1 <- melt(df1,id="Gene",value.name = "value")
+df1$variable = "CTRL"
+df2 <- PD.ctrl.zscore.data %>% rownames_to_column("Gene") 
+df2 <- melt(df2,id="Gene",value.name = "value")
+df2$variable = "CTRL"
+df3 <- Glioma.ctrl.zscore.data %>% rownames_to_column("Gene") 
+df3 <- melt(df3,id="Gene",value.name = "value")
+df3$variable = "CTRL"
+ctrl.data <- merge(goi,(rbind(df1,df2,df3)),by.y="Gene")
+
+zscore.boxplot.df <- rbind(dis.data,ctrl.data)
+
+
+## Plot
+cc <- as.character(goi$Gene)
+for (gene in cc){
+  expr.plot(gene)}
+
+##############################################################
+
+```
+
+
+# FOXO4 characterization
+
+```{r}
+########## Correlation b/n FOXO4 and targets ##############
+
+fox.targets <- data.frame(Gene = c("FOXO4","RBL2","CDKN1A", "CDKN1B", "GADD45A", 
+                           "BCL6", "BCL2L11", "BAX", "SOD2", "CAT","HIF1A")) #define foxo4 targets
+
+## Corplots
+# AD dis data
+idx <- match(fox.targets$Gene, rownames(AD.dis.zscore.data))
+AD.dis.zscore.cor.data  <- as.data.frame(t(AD.dis.zscore.data[idx , ])) %>% remove_rownames()
+testRes = cor.mtest(AD.dis.zscore.cor.data, conf.level = 0.95)
+corrplot(cor(AD.dis.zscore.cor.data), tl.col= "black",p.mat = testRes$p, insig = 'label_sig', sig.level = 0.05,
+         order = 'hclust',hclust.method = "ward.D2", type = 'full',method = 'shade', tl.srt = 45, col = viridis(20,direction = -1),addrect = 3)
+
+# # PD dis data
+# idx <- match(fox.targets$Gene, rownames(PD.dis.zscore.data))
+# PD.dis.zscore.cor.data  <- as.data.frame(t(PD.dis.zscore.data[idx , ])) %>% remove_rownames()
+# testRes = cor.mtest(PD.dis.zscore.cor.data, conf.level = 0.95)
+# corrplot(cor(PD.dis.zscore.cor.data), tl.col= "black",p.mat = testRes$p, insig = 'label_sig', sig.level = 0.05,
+#          order = 'hclust',hclust.method = "ward.D2", type = 'full',method = 'shade', tl.srt = 45, col = viridis(20,direction = -1),addrect = 3)
+
+# Glioma dis data
+idx <- match(fox.targets$Gene, rownames(Glioma.dis.zscore.data))
+Glioma.dis.zscore.cor.data  <- as.data.frame(t(Glioma.dis.zscore.data[idx , ])) %>% remove_rownames()
+testRes = cor.mtest(Glioma.dis.zscore.cor.data, conf.level = 0.95)
+corrplot(cor(Glioma.dis.zscore.cor.data), tl.col= "black",p.mat = testRes$p, insig = 'label_sig', sig.level = 0.05,
+         order = 'hclust', hclust.method = "ward.D2", type = 'full',method = 'shade', tl.srt = 45, col = viridis(20,direction = -1),addrect = 3)
+
+# TCGA LGG
+df <- read.table("C:/Users/ebenezer.asiedu/Desktop/Bioinfo/PROJECT/onconeuro/mutation/lgg_mrna_Zscore_tcga.txt",header = T) %>% drop_na() %>% 
+  dplyr::select(-c("Entrez_Gene_Id")) %>% rename(Gene = Hugo_Symbol)
+TCGA.LGG.dis.zscore.cor.data <- as.data.frame(t(merge(fox.targets,df,by.y="Gene") %>% column_to_rownames("Gene"))) %>% remove_rownames()
+# TCGA GBM
+df <- read.table("C:/Users/ebenezer.asiedu/Desktop/Bioinfo/PROJECT/onconeuro/mutation/gbm_mrna_Zscore_tcga.txt",header = T) %>% drop_na() %>% 
+  dplyr::select(-c("Entrez_Gene_Id")) %>% rename(Gene = Hugo_Symbol)
+TCGA.GBM.dis.zscore.cor.data <- as.data.frame(t(merge(fox.targets,df,by.y="Gene") %>% column_to_rownames("Gene"))) %>% remove_rownames()
+
+# TCGA glioma
+TCGA.Glioma.dis.zscore.cor.data <- rbind(TCGA.LGG.dis.zscore.cor.data, TCGA.GBM.dis.zscore.cor.data)
+
+testRes = cor.mtest(TCGA.Glioma.dis.zscore.cor.data, conf.level = 0.95)
+corrplot(cor(TCGA.Glioma.dis.zscore.cor.data), tl.col= "black",p.mat = testRes$p, insig = 'label_sig', sig.level = 0.05,
+         order = 'hclust', hclust.method = "ward.D2", type = 'full',method = 'shade', tl.srt = 45, col = viridis(20,direction = -1),addrect = 3)
+
+## Plot boxplots for the FOXO4  TF targets
+goi <- fox.targets
+# prep dis data
+df1 <- AD.dis.zscore.data %>% rownames_to_column("Gene") 
+df1 <- melt(df1,id="Gene",value.name = "value")
+df1$variable = "AD"
+df2 <- PD.dis.zscore.data %>% rownames_to_column("Gene") 
+df2 <- melt(df2,id="Gene",value.name = "value")
+df2$variable = "PD"
+df3 <- Glioma.dis.zscore.data %>% rownames_to_column("Gene") 
+df3 <- melt(df3,id="Gene",value.name = "value")
+df3$variable = "Glioma"
+dis.data <- merge(goi,(rbind(df1,df2,df3)),by.y="Gene")
+# prep ctrl data
+df1 <- AD.ctrl.zscore.data %>% rownames_to_column("Gene") 
+df1 <- melt(df1,id="Gene",value.name = "value")
+df1$variable = "CTRL"
+df2 <- PD.ctrl.zscore.data %>% rownames_to_column("Gene") 
+df2 <- melt(df2,id="Gene",value.name = "value")
+df2$variable = "CTRL"
+df3 <- Glioma.ctrl.zscore.data %>% rownames_to_column("Gene") 
+df3 <- melt(df3,id="Gene",value.name = "value")
+df3$variable = "CTRL"
+ctrl.data <- merge(goi,(rbind(df1,df2,df3)),by.y="Gene")
+zscore.boxplot.df <- rbind(dis.data,ctrl.data)
+df <- zscore.boxplot.df %>% filter(variable != "PD")
+colnames(df) <- c("Gene", "Condition","z.score")
+fit <- lm(z.score~Condition + Gene, df)
+fit.p <- as.data.frame(summary(emmeans(fit,pairwise~Condition + Gene)$contrasts,type="response")) %>% dplyr::select(1,2,6) %>% 
+    rename("effect size" = "estimate")
+# Plot
+df$variable <- factor(df$Condition, levels = c("Glioma", "CTRL", "AD"))
+my_cols <- c("#440154FF", "#39568CFF","#35B779FF")
+names(my_cols) <- c("Glioma", "CTRL", "AD")
+ggplot(df, aes(x=Gene,y=z.score, fill=Condition)) + geom_boxplot(alpha=0.5, aes(x = factor(Gene, level = c("FOXO4","BCL6","BCL2L11","BAX","RBL2","CDKN1A","CDKN1B","GADD45A","SOD2","CAT","HIF1A")))) + 
+  theme_classic(base_size = 20) + #geom_jitter(aes(color=variable), size=1.5) + 
+  scale_color_manual(values = my_cols)+ scale_fill_manual(values = my_cols)+
+  theme(legend.position = "right") + xlab("") + ylab("mRNA expression Z-score")
+
+## Correlation scatter for FOXO4 and BCL6
+# AD plots
+p1 <- ggplot(AD.dis.zscore.cor.data, aes(x=FOXO4,y=BCL6)) + geom_smooth(method=lm , color="red", fill="#35B779FF", se=TRUE) + 
+    stat_cor(method = "pearson",) + geom_jitter(size=1,color="#35B779FF") + xlab("FOXO4 mRNA expression Z-score") + ylab("BCL6 mRNA expression Z-score") + theme_classic(base_size = 15) + theme(panel.border = element_rect(size = 1, fill = NA)) + ggtitle("AD brain tissue")
+
+# TCGAglioma plots
+p3 <- ggplot(TCGA.Glioma.dis.zscore.cor.data, aes(x=FOXO4,y=BCL6)) + geom_smooth(method=lm , color="red", fill="#440154FF", se=TRUE) + 
+    stat_cor(method = "pearson",) + geom_jitter(size=1,color="#440154FF") + xlab("FOXO4 mRNA expression Z-score") + ylab("BCL6 mRNA expression Z-score") + theme_classic(base_size = 15) + theme(panel.border = element_rect(size = 1, fill = NA)) + ggtitle("Glioma brain tissue (TCGA)")
+
+scat.cor <- p1 | p3
+
+```
+
+```{r, warning=FALSE,message=FALSE,fig.width=22,fig.height=8}
+## Plot boxplots for the FOXOs
+goi <-  data.frame(Gene = c("FOXO1", "FOXO3", "FOXO4", "FOXO6"))
+# prep dis data
+df1 <- AD.dis.zscore.data %>% rownames_to_column("Gene") 
+df1 <- melt(df1,id="Gene",value.name = "value")
+df1$variable = "AD"
+df2 <- PD.dis.zscore.data %>% rownames_to_column("Gene") 
+df2 <- melt(df2,id="Gene",value.name = "value")
+df2$variable = "PD"
+df3 <- Glioma.dis.zscore.data %>% rownames_to_column("Gene") 
+df3 <- melt(df3,id="Gene",value.name = "value")
+df3$variable = "Glioma"
+dis.data <- merge(goi,(rbind(df1,df2,df3)),by.y="Gene")
+# prep ctrl data
+df1 <- AD.ctrl.zscore.data %>% rownames_to_column("Gene") 
+df1 <- melt(df1,id="Gene",value.name = "value")
+df1$variable = "CTRL"
+df2 <- PD.ctrl.zscore.data %>% rownames_to_column("Gene") 
+df2 <- melt(df2,id="Gene",value.name = "value")
+df2$variable = "CTRL"
+df3 <- Glioma.ctrl.zscore.data %>% rownames_to_column("Gene") 
+df3 <- melt(df3,id="Gene",value.name = "value")
+df3$variable = "CTRL"
+ctrl.data <- merge(goi,(rbind(df1,df2,df3)),by.y="Gene")
+zscore.boxplot.df <- rbind(dis.data,ctrl.data)
+df <- zscore.boxplot.df %>% filter(variable != "PD")
+colnames(df) <- c("Gene", "Condition","z.score")
+fit <- lm(z.score~Condition + Gene, df)
+fit.p <- as.data.frame(summary(emmeans(fit,pairwise~Condition + Gene)$contrasts,type="response")) %>% dplyr::select(1,2,6) %>% 
+    rename("effect size" = "estimate")
+# Plot
+df$variable <- factor(df$Condition, levels = c("Glioma", "CTRL", "AD"))
+my_cols <- c("#440154FF", "#39568CFF","#35B779FF")
+names(my_cols) <- c("Glioma", "CTRL", "AD")
+ggplot(df, aes(x=Gene,y=z.score, fill=Condition)) + geom_boxplot(alpha=0.5, aes(x = factor(Gene, level = c("FOXO4","FOXO1","FOXO3","FOXO6")))) + 
+  theme_classic(base_size = 20) + #geom_jitter(aes(color=variable), size=1.5) + 
+  scale_color_manual(values = my_cols)+ scale_fill_manual(values = my_cols)+
+  theme(legend.position = "right") + xlab("") + ylab("mRNA expression Z-score")
+
+
+
+```

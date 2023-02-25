@@ -1,0 +1,519 @@
+---
+title: "Transcriptomic Profiling"
+output:
+  html_document: default
+pdf_document: default
+---
+
+```{r setup, include=FALSE, message=FALSE}
+library(data.table)
+library(dplyr)
+library(purrr)
+library(tidyverse)
+library(reshape2)
+library(ggplot2)
+library(pheatmap)
+library(plyr)
+library(vsn)
+library(tidyr)
+library(DESeq2)
+library(RUVSeq)
+library(glmGamPoi)
+library(clusterProfiler)
+library(org.Hs.eg.db)
+library(ggrepel)
+library(ggvenn)
+library(ggsci)
+library(Biobase)
+library(AnnotationDbi)
+library(GEOquery)
+library(limma)
+library(viridis)
+library(ggpubr)
+library(survival)
+library(survminer)
+library(emmeans)
+library(car)
+library(corrplot)
+library(correlation)
+library(splitstackshape)
+library(STRINGdb)
+library(glue)
+library(tibble)
+
+knitr::opts_chunk$set(echo = TRUE)
+
+```
+
+#  {.tabset}
+
+# Define path 
+
+```{r}
+# define working directory path
+workPath <- "C:/Users/ebenezer.asiedu/Desktop/Bioinfo/PROJECT/onconeuro/"
+
+```
+
+# Prep geneInfo
+
+```{r, include=FALSE,message=FALSE}
+## Prep gene sets for GSEA 
+mypath <- paste0(workPath, "transcriptomics/gmt/")
+setwd(mypath)
+files <- list.files(mypath, pattern ="*.gmt")
+df <- map(files, .f=read.gmt)
+gmt <- do.call(rbind,df)
+gmt$term <- tolower(gmt$term)
+
+############# Some Preps ##################
+## Prep gene length for TPM normalization
+# use ensembl gtf files and gtftools to obtain gene lengths
+setwd(paste0(workPath,"/gene.length/"))
+# hg38
+k <- read.delim(paste0(workPath,"gene.length/hg38.gene.txt")) %>%
+ dplyr::select(c(1,5)) %>% rename(Length=merged) %>% rename(ENSEMBL=gene)
+kk <- bitr(k$ENSEMBL, fromType = "ENSEMBL",toType = c("SYMBOL","ENTREZID"), OrgDb = org.Hs.eg.db)
+kkk <- merge(k,kk,by.y="ENSEMBL", all=F) %>% drop_na()
+write.csv(kkk,"hg38.gene.anno.csv")
+
+###########################################
+
+```
+
+
+# Define Functions
+
+```{r, echo=FALSE,message=FALSE, warning=FALSE}
+# transcript per million(tpm) function
+tpm <- function(counts, lengths="Length") {
+  rate <- counts / lengths
+  rate / sum(rate) * 1e6}
+
+# function for running deseq2 analysis: locally generated raw counts
+prepseq1 <- function(id,hc_id, dis_id,mypath){
+    #hc_id/dis_id = unique first letter(s) for CTRL or DIS,
+    setwd(mypath)
+    files <- list.files(mypath, pattern ="*_fcounts.txt")
+    df <- map(files, .f=fread,header=TRUE, select = c(6:8))
+    zz = c(1:length(df))
+    for (i in zz){
+      df[[zz[i]]] <- df[[zz[i]]] %>% dplyr::mutate(tpm(df[[zz[i]]][[paste(colnames(df[[zz[i]]][,3]))]], df[[zz[i]]]$Length), .before=3)
+      df[[zz[i]]] <- df[[zz[i]]] %>%  dplyr::select(2,3)
+      df[[zz[i]]] <- df[[zz[i]]][!duplicated(df[[zz[i]]][["gene_name"]]),]
+      df[[zz[i]]] <- drop_na(df[[zz[i]]])}
+    # Get count data
+    cts <- join_all(df, by = "gene_name", match = "all")
+    cts = cts %>%  remove_rownames %>% column_to_rownames(var="gene_name")
+    colnames(cts) = gsub("\\_.*","",files)
+    # Prepare metadata
+    setwd(mypath)
+    sampleTable <- read.csv(paste0(mypath,"SraRunTable.csv"), header=T) %>%  dplyr::select(c("Run", "Group"))
+    colnames(sampleTable) = c("sampleName", "Condition")
+    sampleFiles <- as.data.frame(list.files(mypath, pattern = "*_fcounts.txt"))
+    colnames(sampleFiles) = c("sampleFiles")
+    sampleFiles$sampleName = gsub("\\_.*","", sampleFiles$sampleFiles)
+    sampleTable <- merge(sampleTable, sampleFiles, by.y = "sampleName")
+
+    #prep for DESEQ2 analysis
+    coldata <- sampleTable %>% 
+      mutate(condition = case_when(startsWith(as.character(Condition), hc_id) ~ "CTRL",                                         
+                                   startsWith(as.character(Condition), dis_id) ~ "DIS")) %>%
+      dplyr::select("sampleName", "condition") %>% drop_na()
+    idx <- match(coldata$sampleName, colnames(cts))
+    cts  <- cts[ , idx]
+    #DEGs <- mydeseq(id)
+    coldata = coldata %>%  remove_rownames %>% column_to_rownames(var="sampleName")
+    coldata$condition <- factor(coldata$condition)
+    condition <- factor(colnames(cts))
+    # cross-check data
+    all(rownames(coldata) == colnames(cts))
+    # Pre-filter genes with low counts
+    dds <- DESeqDataSetFromMatrix(countData = round(cts), colData = coldata, design = ~ condition)
+    keep <- rowSums(counts(dds)) >= 10
+    dds <- dds[keep,]
+    #PCA and Variance stabilization
+    vsd <- vst(dds, blind=FALSE)
+    rv <- rowVars(assay(vsd))
+    print(plotPCA(vsd))
+    # determine degs
+    deg <- DESeq(dds, fitType = "glmGamPoi")
+    res <- results(deg, alpha = 0.05, contrast=c("condition","DIS","CTRL")) 
+    # Removing unwanted variation 
+    set <- newSeqExpressionSet(counts(deg))
+    set <- betweenLaneNormalization(set, which="upper")
+    not_sig <- rownames(res)[which(res$pvalue > 0.2)]
+    empirical <- rownames(set)[ rownames(set) %in% not_sig ]
+    set <- RUVg(set, empirical, k=1)
+    pdat <- pData(set)
+    pdat$condition <- condition
+    vsd$W1 <- pdat$W_1
+    plotPCA(vsd, intgroup="W1")
+    # add factors to design and retest for degs
+    pdat$condition = NULL
+    colData(deg) <- cbind(colData(deg), pdat)
+    design(deg) <- ~W_1 + condition
+    deg <- DESeq(deg, test="LRT", reduced=~W_1)
+    res <- results(deg, alpha = 0.05, contrast=c("condition","DIS","CTRL"))
+    resOrdered <- res[order(res$padj),]
+    # Assessment plots
+    meanSdPlot(assay(vsd))
+    #DESeq2::plotMA(res, ylim=c(-5,5)) 
+    #select <- order(rowMeans(counts(deg,normalized=TRUE)), decreasing=TRUE)[1:100]
+    #pheatmap(assay(vsd)[select,], show_rownames=F, show_colnames = F, annotation_col=coldata,
+    #         angle_col = "45")
+    genes <- data.frame(c(1:10))
+    # Save DEGs
+    # Get degs
+    DEGs <- as.data.frame(resOrdered) %>% dplyr::select(log2FoldChange, padj) %>% 
+      rename(logFC = log2FoldChange) %>% rownames_to_column(var = "Gene") %>% drop_na()
+
+# # Prepare degs for GSEA
+   k <- DEGs
+     if ("2597" %in% k$Gene){anno <- "ENTREZID"}
+     if ("ENSG00000111640" %in% k$Gene){anno <- "ENSEMBL"}
+     if ("GAPDH" %in% k$Gene){anno <- "SYMBOL"}
+   k <- k %>% dplyr::filter(padj < 0.05) %>% dplyr::filter(logFC < -0.5 | logFC > 0.5) %>% dplyr::select(c(Gene,logFC))
+   colnames(k) <- c(anno, id)
+  if (anno == "SYMBOL"){
+    k <- k %>% rename("Gene" = "SYMBOL")}
+  if (anno == "ENTREZID"){
+    c <- bitr(k[[anno]], fromType = c(anno),toType = c("SYMBOL"), OrgDb = org.Hs.eg.db)
+    k <- merge(k,c,by.y=anno) %>% dplyr::select(-c(anno)) %>% rename("Gene" = "SYMBOL")}
+  if (anno == "ENSEMBL"){
+    c <- bitr(k[[anno]], fromType = c(anno),toType = c("SYMBOL"), OrgDb = org.Hs.eg.db)
+    k <- merge(k,c,by.y=anno) %>% dplyr::select(-c(anno)) %>% rename("Gene" = "SYMBOL")}
+
+   
+# Run GSEA
+  go <- k
+  go <- go[order(-go[[id]]),]
+  original_gene_list <- go[[id]]
+  names(original_gene_list) <- go[["Gene"]]
+  gene_list<-na.omit(original_gene_list)
+  gene_list = sort(gene_list, decreasing = TRUE)
+  GSEA <- GSEA(geneList = gene_list, exponent = 1,  minGSSize = 10,  maxGSSize = 500,
+            eps = 1e-10,   pvalueCutoff = 0.05,   pAdjustMethod = "BH",   verbose = TRUE, TERM2GENE = gmt,
+            seed = FALSE,  by = "fgsea")
+  GSEAresults <- GSEA@result
+return(list(GSEA=GSEAresults, counts=cts, meta=coldata, sig.degs=k, degs=DEGs, geneInfo=genes))}
+
+
+# function for running deseq2 analysis: downloaded files
+prepseq <- function(id, study_type, is.platform=FALSE, plat="GPL96", unique.id="itle", ctrl_id="control", type=1,
+                    dis_id="disease", anno="ENSEMBL", anno_col="ID", cts_col="counts", 
+                    filetype="txt", mypath="~"
+                    #id = GEO ID or any id for the data
+                    #study_type = RNA-seq or microarray
+                    #is.platform = if microarray, does it have mulitplatforms
+                    #plat = if is.platform = TRUE,what platform is that
+                    #type= type of input data: details below
+                    # 2 = matrix with raw counts 
+                    # 3 = sample with TPM counts, 4 = matrix with TPM counts,
+                    # 5 = samples with raw counts & no header 
+                    # 6 = samples with TPM counts & no header 
+                    #anno= gene annotation format eg ENSEMBL, ENTREZID, etc,
+                    #anno_col = column that contains gene names/ids
+                    #cts_col=column that contains sample ids or count data, 
+                    #filetype=extension of count files eg txt,csv,tsv
+                    #mypath = workind directory or path to files
+                    ){
+  if (study_type == "RNAseq"){
+  # Prepare metadata
+    if (filetype == "txt"){ww <- "*.txt"}
+    if (filetype == "csv"){ww <- "*.csv"}
+    if (filetype == "tsv"){ww <- "*.tsv"}
+    gL <- read.csv(paste0(workPath,"gene.length/hg38.gene.anno.csv")) %>% 
+    dplyr::select(c(anno,"Length"))
+    colnames(gL) <- c(anno_col, "Length")
+    
+    if (type == 0){
+    setwd(mypath)
+    files <- list.files(mypath, pattern ="*_fcounts.txt")
+    df <- map(files, .f=fread,header=TRUE, select = c(6:8))
+    zz = c(1:length(df))
+    for (i in zz){
+      df[[zz[i]]] <- df[[zz[i]]] %>% dplyr::mutate(tpm(df[[zz[i]]][[paste(colnames(df[[zz[i]]][,3]))]], df[[zz[i]]]$Length), .before=3)
+      df[[zz[i]]] <- df[[zz[i]]] %>%  dplyr::select(2,3)
+      df[[zz[i]]] <- df[[zz[i]]][!duplicated(df[[zz[i]]][["gene_name"]]),]
+      df[[zz[i]]] <- drop_na(df[[zz[i]]])}
+    # Get count data
+    cts <- join_all(df, by = "gene_name", match = "all")
+    cts = cts %>%  remove_rownames %>% column_to_rownames(var="gene_name")
+    colnames(cts) = gsub("\\_.*","",files)}
+    
+    if (type == 1){
+      setwd(mypath)
+      files <- list.files(mypath, pattern=ww)
+      df <- map_dfc(files, .f=fread,header=TRUE,select = c(anno_col,cts_col)) %>% remove_rownames()
+      cts <- df %>% dplyr::select(contains("count"))
+      cts <- cbind(Gene = df[[1]], cts)
+      cts$Gene = gsub("\\..*","", cts$Gene) 
+      cts <- cts[!duplicated(cts$Gene),] %>% column_to_rownames(var = "Gene")
+      colnames(cts) = gsub("\\_.*","",files)
+      cts[anno_col] = rownames(cts)
+
+      cts <- join_all(list(cts,gL), by=anno_col, match = "all") %>% drop_na() 
+      cts <- cts[!duplicated(cts[[anno_col]]),] %>% remove_rownames() %>%  column_to_rownames(anno_col)
+      
+      #Calculate tpm for each colum
+      zz = c(1:(length(colnames(cts)) - 1))
+      for (i in zz){
+      cts[i] <- cts[[zz[i]]] %>% tpm(lengths = cts$Length)}
+      cts$Length = NULL }
+      
+    if (type == 2){
+      setwd(mypath)
+      k <- read.csv(paste0(mypath,"counts.csv"))
+      colnames(k) <- gsub("X", "", colnames(k))
+      colnames(k) <- gsub("-", ".", colnames(k))
+      colnames(k) <- gsub("_", ".", colnames(k))
+      cts <- merge(k,gL,by.y=anno_col)
+      cts <- cts[!duplicated(cts[[anno_col]]),] %>% remove_rownames %>%  column_to_rownames(var = anno_col)
+      for(i in colnames(cts)){
+        cts[i] <- cts[i] %>% dplyr::mutate(tpm(cts[i], cts$Length))} 
+      cts$Length = NULL}
+
+    if (type == 3){
+      setwd(mypath)
+      files <- list.files(mypath, pattern=ww)
+      df <- map(files, .f=fread,header=TRUE,select = c(anno_col,cts_col))
+      cts <- join_all(df, by = anno_col, match = "all")
+      cts = cts %>%  remove_rownames %>% column_to_rownames(var=anno_col)
+      colnames(cts) = gsub("\\_.*","",files)}
+    
+    if (type == 4){
+      setwd(mypath)
+      cts <- read.csv(paste0(mypath,"counts.csv"))
+      cts = cts %>%  remove_rownames %>% column_to_rownames(var=anno_col)}
+    
+    if (type == 5){
+      setwd(mypath)
+      files <- list.files(mypath, pattern=ww)
+      df <- map(files, .f=fread,header=FALSE)
+      cts <- join_all(df, by = "V1", match = "all") %>% remove_rownames() %>% 
+        column_to_rownames(var = "V1")
+      colnames(cts) = gsub("\\_.*","",files)
+      cts <- cts %>% rownames_to_column(var=anno)
+      cts <- merge(cts,gL,by.y=anno)
+      cts <- cts[!duplicated(cts[[anno]]),] %>% remove_rownames %>%  column_to_rownames(var = anno)
+      for(i in colnames(cts)){
+        cts[i] <- cts[i] %>% dplyr::mutate(tpm(cts[i], cts$Length))} 
+      cts$Length = NULL}
+    
+      if (type == 6){
+      setwd(mypath)
+      files <- list.files(mypath, pattern=ww)
+      df <- map(files, .f=fread,header=FALSE)
+      cts <- join_all(df, by = "V1", match = "all") %>% remove_rownames() %>% 
+        column_to_rownames(var = "V1")
+      colnames(cts) = gsub("\\_.*","",files)
+      cts <- cts %>% rownames_to_column(var=anno_col)}
+    
+    #prep for DESEQ2 analysis
+    coldata <- read.csv(paste0(mypath,"meta.csv"))  %>% dplyr::select(c(sampleName,condition))
+    idx <- match(coldata$sampleName, colnames(cts))
+    cts  <- cts[ , idx]
+    #DEGs <- mydeseq(id)
+    coldata = coldata %>%  remove_rownames %>% column_to_rownames(var="sampleName")
+    coldata$condition <- factor(coldata$condition)
+    condition <- factor(colnames(cts))
+    # cross-check data
+    all(rownames(coldata) == colnames(cts))
+    # Pre-filter genes with low counts
+    dds <- DESeqDataSetFromMatrix(countData = round(cts), colData = coldata, design = ~ condition)
+    keep <- rowSums(counts(dds)) >= 10
+    dds <- dds[keep,]
+    #PCA and Variance stabilization
+    vsd <- vst(dds, blind=FALSE)
+    rv <- rowVars(assay(vsd))
+    print(plotPCA(vsd))
+    # determine degs
+    deg <- DESeq(dds, fitType = "glmGamPoi")
+    res <- results(deg, alpha = 0.05, contrast=c("condition","DIS","CTRL")) 
+    # Removing unwanted variation 
+    set <- newSeqExpressionSet(counts(deg))
+    set <- betweenLaneNormalization(set, which="upper")
+    not_sig <- rownames(res)[which(res$pvalue > 0.2)]
+    empirical <- rownames(set)[ rownames(set) %in% not_sig ]
+    set <- RUVg(set, empirical, k=1)
+    pdat <- pData(set)
+    pdat$condition <- condition
+    vsd$W1 <- pdat$W_1
+    plotPCA(vsd, intgroup="W1")
+    # add factors to design and retest for degs
+    pdat$condition = NULL
+    colData(deg) <- cbind(colData(deg), pdat)
+    design(deg) <- ~W_1 + condition
+    deg <- DESeq(deg, test="LRT", reduced=~W_1)
+    res <- results(deg, alpha = 0.05, contrast=c("condition","DIS","CTRL"))
+    resOrdered <- res[order(res$padj),]
+    # Assessment plots
+    meanSdPlot(assay(vsd))
+    #DESeq2::plotMA(res, ylim=c(-5,5)) 
+    #select <- order(rowMeans(counts(deg,normalized=TRUE)), decreasing=TRUE)[1:100]
+    #pheatmap(assay(vsd)[select,], show_rownames=F, show_colnames = F, annotation_col=coldata,
+    #         angle_col = "45")
+    genes <- data.frame(c(1:10))
+    # Save DEGs
+    # Get degs
+    DEGs <- as.data.frame(resOrdered) %>% dplyr::select(log2FoldChange, padj) %>% 
+      rename(logFC = log2FoldChange) %>% rownames_to_column(var = "Gene") %>% drop_na()}
+  
+  # For microarrray data
+  if (study_type == "microarray"){
+    setwd(mypath)
+    # Single platform
+    if (is.platform == FALSE){
+      setwd(mypath)
+      gset <- getGEO(id)
+      if (id == "GSE108474"){cts <- as.data.frame(gset[[paste0(id, "_series_matrix.txt.gz",sep="")]]@assayData[["exprs"]])} 
+      else {
+      cts <- as.data.frame(gset[[paste0(id, "_series_matrix.txt.gz",sep="")]]@assayData[["exprs"]])
+      #hist(melt(cts)$value) # check count distribution
+      cts <- as.data.frame(normalizeBetweenArrays(cts))
+      }
+      genes <- as.data.frame(gset[[paste0(id, "_series_matrix.txt.gz",sep="")]]@featureData@data)
+      # Get phenodata
+      pheno <- as.data.frame(gset[[paste0(id, "_series_matrix.txt.gz",sep="")]]@phenoData@data) %>%
+        dplyr::select(contains(unique.id)) %>% rownames_to_column("ID")
+      colnames(pheno) <- c("ID", "grp")
+      coldata <- pheno %>% mutate_at(vars(grp), funs(replace(., grepl(ctrl_id, .), "CTRL"))) %>% 
+        mutate_at(vars(grp), funs(replace(., grepl(dis_id, .), "DIS"))) %>% 
+        filter(grp == "CTRL" | grp ==  "DIS")}
+      #multiple platform
+     if (is.platform == TRUE){
+      setwd(path)
+      gset <- getGEO(id)
+      platform <- paste0(id, "-",plat,sep="")
+      cts <- as.data.frame(gset[[paste0(platform, "_series_matrix.txt.gz",sep="")]]@assayData[["exprs"]])%>% 
+      rownames_to_column(var = "ID")
+      hist(melt(cts)$value) # check count distribution
+      cts <- as.data.frame(normalizeBetweenArrays(cts))
+      hist(melt(cts)$value) 
+      genes <- as.data.frame(gset[[paste0(platform, "_series_matrix.txt.gz",sep="")]]@featureData@data)
+      # Get phenodata
+      pheno <- as.data.frame(gset[[paste0(platform, "_series_matrix.txt.gz",sep="")]]@phenoData@data) %>%
+        dplyr::select(contains(unique.id)) %>% rownames_to_column("ID")
+      colnames(pheno) <- c("ID", "grp")
+      coldata <- pheno %>% mutate_at(vars(grp), funs(replace(., grepl(ctrl_id, .), "CTRL"))) %>% 
+        mutate_at(vars(grp), funs(replace(., grepl(dis_id, .), "DIS"))) %>% 
+        filter(grp == "CTRL" | grp ==  "DIS")}
+    # Get gene info
+    # Differential expression from microarray data
+    #name <- paste0(id, ".top.table.tsv",sep="")
+    data <- read_tsv(paste0(id, ".top.table.tsv", sep="")) %>% 
+      dplyr::select(c("Gene","adj.P.Val", "logFC")) %>% rename("padj"="adj.P.Val")
+    DEGs <- data[!duplicated(data$Gene),]}
+
+# Prepare degs for GSEA
+  k <- DEGs
+  #  if ("2597" %in% k$Gene){anno <- "ENTREZID"}
+  #  if ("ENSG00000111640" %in% k$Gene){anno <- "ENSEMBL"}
+  #  if ("GAPDH" %in% k$Gene){anno <- "SYMBOL"}
+  k <- k %>% dplyr::filter(padj < 0.05) %>% dplyr::filter(logFC < -0.5 | logFC > 0.5) %>% dplyr::select(c(Gene,logFC))
+  colnames(k) <- c(anno, id)
+  if (anno == "SYMBOL"){
+    k <- k %>% rename("Gene" = "SYMBOL")}
+  if (anno == "ENTREZID"){
+    c <- bitr(k[[anno]], fromType = c(anno),toType = c("SYMBOL"), OrgDb = org.Hs.eg.db)
+    k <- merge(k,c,by.y=anno) %>% dplyr::select(-c(anno)) %>% rename("Gene" = "SYMBOL")}
+  if (anno == "ENSEMBL"){
+    c <- bitr(k[[anno]], fromType = c(anno),toType = c("SYMBOL"), OrgDb = org.Hs.eg.db)
+    k <- merge(k,c,by.y=anno) %>% dplyr::select(-c(anno)) %>% rename("Gene" = "SYMBOL")}
+    
+    
+# Run GSEA
+  go <- k
+  go <- go[order(-go[[id]]),]
+  original_gene_list <- go[[id]]
+  names(original_gene_list) <- go[["Gene"]]
+  gene_list<-na.omit(original_gene_list)
+  gene_list = sort(gene_list, decreasing = TRUE)
+  GSEA <- GSEA(geneList = gene_list, exponent = 1,  minGSSize = 10,  maxGSSize = 500,
+            eps = 1e-10,   pvalueCutoff = 0.05,   pAdjustMethod = "BH",   verbose = TRUE, TERM2GENE = gmt,
+            seed = FALSE,  by = "fgsea")
+  GSEAresults <- GSEA@result
+return(list(GSEA=GSEAresults, counts=cts, meta=coldata, sig.degs=k, degs=DEGs, geneInfo=genes))}
+
+```
+
+
+## Alzheimers data prep {.tabset}
+
+```{r}
+#GSE125583
+GSE125583.seq.data <- prepseq(id="GSE125583", study_type="RNAseq", is.platform=FALSE, plat="GPL96", 
+                              unique.id="itle",ctrl_id="control", type=1,dis_id="disease", anno="ENTREZID",anno_col="ID_REF", cts_col="count", 
+                              filetype="tsv", mypath= paste0(workPath,"transcriptomics/AD/GSE125583/"))
+
+#GSE193438
+GSE193438.seq.data <- prepseq(id="GSE193438", study_type="RNAseq", type=1, anno="ENSEMBL", anno_col="annotation.gene_id", cts_col="expected_count",
+                              is.platform=FALSE, plat="GPL96", unique.id="itle", ctrl_id="control",dis_id="disease", filetype="txt",
+                              mypath =  paste0(workPath,"transcriptomics/AD/GSE193438/"))
+
+#GSE104704
+GSE104704.seq.data <- prepseq(id="GSE104704", study_type="RNAseq", type=2, anno="SYMBOL", anno_col="SYMBOL", cts_col="expected_count",
+                              is.platform=FALSE, plat="GPL96", unique.id="itle", ctrl_id="control",dis_id="disease", filetype="txt",
+                              mypath =  paste0(workPath,"transcriptomics/AD/GSE104704/"))
+
+#GSE153873
+GSE153873.seq.data <- prepseq(id="GSE153873", study_type="RNAseq", type=2, anno="SYMBOL", anno_col="SYMBOL", cts_col="expected_count",
+                              is.platform=FALSE, plat="GPL96", unique.id="itle", ctrl_id="control",dis_id="disease", filetype="txt",
+                              mypath =  paste0(workPath,"transcriptomics/AD/GSE153873/"))
+
+# GSE15222
+GSE15222.seq.data <- prepseq(id="GSE15222", study_type="microarray", type=1, anno="SYMBOL", anno_col="ID_REF", cts_col="expected_count",
+                              is.platform=FALSE, plat="GPL96", unique.id="itle", ctrl_id="ACON",dis_id="AAD", filetype="txt",
+                              mypath =  paste0(workPath,"transcriptomics/AD/GSE15222/"))
+
+#GSE122063
+GSE122063.seq.data <- prepseq(id="GSE122063", study_type="microarray", type=1, anno="SYMBOL", anno_col="ID_REF", cts_col="expected_count",
+                              is.platform=FALSE, plat="GPL96", unique.id="itle", ctrl_id="Control",dis_id="AD", filetype="txt",
+                              mypath =  paste0(workPath,"transcriptomics/AD/GSE122063/"))
+
+#GSE5281
+GSE5281.seq.data <- prepseq(id="GSE5281", study_type="microarray", type=1, anno="SYMBOL", anno_col="ID_REF", cts_col="expected_count",
+                              is.platform=FALSE, plat="GPL96", unique.id="itle", ctrl_id="control",dis_id="affected", filetype="txt",
+                              mypath =  paste0(workPath,"transcriptomics/AD/GSE5281/"))
+
+#GSE132903
+GSE132903.seq.data <- prepseq(id="GSE132903", study_type="microarray", type=1, anno="SYMBOL", anno_col="ID_REF", cts_col="expected_count",
+                              is.platform=FALSE, plat="GPL96", unique.id="itle", ctrl_id="ND",dis_id="AD", filetype="txt",
+                              mypath =  paste0(workPath,"transcriptomics/AD/GSE132903/"))
+
+#GSE48350
+GSE48350.seq.data <- prepseq(id="GSE48350", study_type="microarray", type=1, anno="SYMBOL", anno_col="ID_REF", cts_col="expected_count",
+                              is.platform=FALSE, plat="GPL96", unique.id="itle", ctrl_id="indiv",dis_id="AD", filetype="txt",
+                              mypath =  paste0(workPath,"transcriptomics/AD/GSE48350/"))
+
+
+#GSE110226
+GSE110226.seq.data <- prepseq(id="GSE110226", study_type="microarray", type=1, anno="SYMBOL", anno_col="ID_REF", cts_col="expected_count",
+                              is.platform=FALSE, plat="GPL96", unique.id="itle", ctrl_id="CTR",dis_id="ALZ", filetype="txt",
+                              mypath =  paste0(workPath,"transcriptomics/AD/GSE110226/"))
+
+#GSE29378
+GSE29378.seq.data <- prepseq(id="GSE29378", study_type="microarray", type=1, anno="SYMBOL", anno_col="ID_REF", cts_col="expected_count",
+                              is.platform=FALSE, plat="GPL96", unique.id="itle", ctrl_id="Control",dis_id="AD", filetype="txt",
+                              mypath =  paste0(workPath,"transcriptomics/AD/GSE29378/"))
+
+
+#GSE138260
+GSE138260.seq.data <- prepseq(id="GSE138260", study_type="microarray", type=1, anno="SYMBOL", anno_col="ID_REF", cts_col="expected_count",
+                              is.platform=FALSE, plat="GPL96", unique.id="itle", ctrl_id="control",dis_id="AD", filetype="txt",
+                              mypath =  paste0(workPath,"transcriptomics/AD/GSE138260/"))
+
+#GSE109887
+GSE109887.seq.data <- prepseq(id="GSE109887", study_type="microarray", type=1, anno="SYMBOL", anno_col="ID_REF", cts_col="expected_count",
+                              is.platform=FALSE, plat="GPL96", unique.id="itle", ctrl_id="Control",dis_id="AD", filetype="txt",
+                              mypath =  paste0(workPath,"transcriptomics/AD/GSE109887/"))
+
+#GSE39420
+GSE39420.seq.data <- prepseq(id="GSE39420", study_type="microarray", type=1, anno="SYMBOL", anno_col="ID_REF", cts_col="expected_count",
+                              is.platform=FALSE, plat="GPL96", unique.id="itle", ctrl_id="control",dis_id="disease", filetype="txt",
+                              mypath =  paste0(workPath,"transcriptomics/AD/GSE39420/"))
+
+
+```
+
