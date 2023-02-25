@@ -1,0 +1,32 @@
+Cancer Type Detailed	Alteration Frequency	Alteration Type	Alteration Count
+Anaplastic Oligoastrocytoma	10.256410256410255	multiple	8
+Anaplastic Oligoastrocytoma	50	hetloss	39
+Anaplastic Oligoastrocytoma	30.76923076923077	gain	24
+Anaplastic Oligoastrocytoma	7.6923076923076925	amp	6
+Anaplastic Astrocytoma	6.153846153846154	multiple	8
+Anaplastic Astrocytoma	32.30769230769231	hetloss	42
+Anaplastic Astrocytoma	1.5384615384615385	homdel	2
+Anaplastic Astrocytoma	50.76923076923077	gain	66
+Anaplastic Astrocytoma	7.6923076923076925	amp	10
+Glioblastoma Multiforme	12.289562289562289	multiple	73
+Glioblastoma Multiforme	21.885521885521886	hetloss	130
+Glioblastoma Multiforme	1.0101010101010102	homdel	6
+Glioblastoma Multiforme	59.427609427609426	gain	353
+Glioblastoma Multiforme	1.6835016835016834	amp	10
+Glioblastoma Multiforme	1.0101010101010102	mutated	6
+Oligodendroglioma	3.5398230088495577	multiple	4
+Oligodendroglioma	47.78761061946903	hetloss	54
+Oligodendroglioma	1.7699115044247788	homdel	2
+Oligodendroglioma	32.743362831858406	gain	37
+Oligodendroglioma	9.734513274336283	amp	11
+Oligoastrocytoma	6.153846153846154	multiple	8
+Oligoastrocytoma	39.23076923076923	hetloss	51
+Oligoastrocytoma	3.076923076923077	homdel	4
+Oligoastrocytoma	35.38461538461539	gain	46
+Oligoastrocytoma	10.76923076923077	amp	14
+Astrocytoma	3.125	multiple	2
+Astrocytoma	31.25	hetloss	20
+Astrocytoma	3.125	homdel	2
+Astrocytoma	42.1875	gain	27
+Astrocytoma	9.375	amp	6
+Astrocytoma	1.5625	mutated	1
